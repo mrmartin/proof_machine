@@ -1,0 +1,6 @@
+;; Adversarial: step 2 cites a premise that does not exist.
+;; V must REJECT.
+(cert
+  (step 1 (rule REFL) (witness (term "x:ind")) (premises))
+  (step 2 (rule TRANS) (witness ()) (premises 1 99))
+  (concl "(x:ind = x:ind)"))

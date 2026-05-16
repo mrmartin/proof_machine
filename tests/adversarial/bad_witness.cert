@@ -1,0 +1,7 @@
+;; Adversarial: TRANS demands that the LHS of step 2's equation match
+;; the RHS of step 1's equation.  Here they don't.  V must REJECT.
+(cert
+  (step 1 (rule REFL) (witness (term "x:ind")) (premises))
+  (step 2 (rule REFL) (witness (term "y:ind")) (premises))
+  (step 3 (rule TRANS) (witness ()) (premises 1 2))
+  (concl "(x:ind = y:ind)"))

@@ -1,0 +1,10 @@
+(library
+ (name frontend)
+ (wrapped true)
+ (modules theory elaborate)
+ (libraries kernel))
+
+(executable
+ (name elab_main)
+ (modules elab_main)
+ (libraries kernel frontend))

@@ -1,0 +1,10 @@
+(library
+ (name provers)
+ (wrapped true)
+ (modules prover_api lookup enumerator scripted)
+ (libraries kernel))
+
+(executable
+ (name pipeline_main)
+ (modules pipeline_main)
+ (libraries kernel frontend provers))

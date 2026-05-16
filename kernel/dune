@@ -1,0 +1,9 @@
+(library
+ (name kernel)
+ (wrapped true)
+ (modules type term thm rules axioms cert verify))
+
+(executable
+ (name kernel_main)
+ (modules kernel_main)
+ (libraries kernel))

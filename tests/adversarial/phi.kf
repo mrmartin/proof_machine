@@ -1,0 +1,4 @@
+;; A minimal phi file for adversarial tests — goal is x:ind = x:ind.
+;; The adversarial certs above all CLAIM to prove this (or fail before
+;; getting there); V must reject each one.
+(goal "(x:ind = x:ind)")

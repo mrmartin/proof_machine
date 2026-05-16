@@ -1,0 +1,4 @@
+(executable
+ (name render_main)
+ (modules render_main)
+ (libraries kernel))

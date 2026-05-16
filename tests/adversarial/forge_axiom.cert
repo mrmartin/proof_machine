@@ -1,0 +1,5 @@
+;; Adversarial: cite an axiom that wasn't declared by the .kf file.
+;; V must REJECT.
+(cert
+  (step 1 (rule AXIOM) (witness (axiom "this_axiom_does_not_exist")) (premises))
+  (concl "(x:ind = x:ind)"))

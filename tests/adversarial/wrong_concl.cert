@@ -1,0 +1,5 @@
+;; Adversarial: REFL produces (x = x) but the cert declares concl (x = y).
+;; V must REJECT (final-step ≠ declared concl).
+(cert
+  (step 1 (rule REFL) (witness (term "x:ind")) (premises))
+  (concl "(x:ind = y:ind)"))
