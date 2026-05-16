@@ -1,0 +1,48 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{longtable}
+\usepackage{xcolor}
+\newtheorem{theorem}{Theorem}
+\newcommand{\stepid}[1]{{\color{gray}\scriptsize #1}}
+\title{euclid}
+\author{\texttt{proof\_machine}}
+\date{Verified by the sealed kernel V}
+\begin{document}
+\maketitle
+\section*{Statement}
+\begin{theorem}[euclid]
+$$\forall n\!:\!\mathbb{N}.\, \exists p\!:\!\mathbb{N}.\, ((p > n) \wedge \mathrm{prime}(p))$$
+\end{theorem}
+
+\section*{Declared axioms}
+The proof cites the following theory-package axioms (trusted assumptions for v0.1):
+\begin{itemize}
+  \item \texttt{fact\_pos}: $\forall n\!:\!\mathbb{N}.\, ((n! + 1) \geq 1)$
+  \item \texttt{has\_prime\_divisor}: $\forall m\!:\!\mathbb{N}.\, \exists p\!:\!\mathbb{N}.\, (\mathrm{prime}(p) \wedge (p \mid m))$
+  \item \texttt{euclid\_step}: $\forall p\!:\!\mathbb{N}.\, \forall n\!:\!\mathbb{N}.\, ((\mathrm{prime}(p) \wedge (p \mid (n! + 1))) \Rightarrow (p > n))$
+\end{itemize}
+
+\section*{Proof trace}
+Each row is one primitive kernel step. The trace was verified by \texttt{vrfy} as a Cook--Reckhow certificate.
+
+\begin{longtable}{rlp{6.5cm}l}
+\textbf{\#} & \textbf{rule} & \textbf{conclusion} & \textbf{from} \\
+\hline
+\stepid{1} & \textbf{axiom} [\texttt{has\_prime\_divisor}] & $\forall m\!:\!\mathbb{N}.\, \exists p\!:\!\mathbb{N}.\, (\mathrm{prime}(p) \wedge (p \mid m))$ & -- \\
+\stepid{2} & $\forall$-elim (SPEC) at $(n! + 1)$ & $\exists p\!:\!\mathbb{N}.\, (\mathrm{prime}(p) \wedge (p \mid (n! + 1)))$ & 1 \\
+\stepid{3} & assume at $(\mathrm{prime}(p) \wedge (p \mid (n! + 1)))$ & $(\mathrm{prime}(p) \wedge (p \mid (n! + 1)))$ & -- \\
+\stepid{4} & $\wedge$-elim left & $\mathrm{prime}(p)$ & 3 \\
+\stepid{5} & \textbf{axiom} [\texttt{euclid\_step}] & $\forall p\!:\!\mathbb{N}.\, \forall n\!:\!\mathbb{N}.\, ((\mathrm{prime}(p) \wedge (p \mid (n! + 1))) \Rightarrow (p > n))$ & -- \\
+\stepid{6} & $\forall$-elim (SPEC) at $p$ & $\forall n\!:\!\mathbb{N}.\, ((\mathrm{prime}(p) \wedge (p \mid (n! + 1))) \Rightarrow (p > n))$ & 5 \\
+\stepid{7} & $\forall$-elim (SPEC) at $n$ & $((\mathrm{prime}(p) \wedge (p \mid (n! + 1))) \Rightarrow (p > n))$ & 6 \\
+\stepid{8} & modus ponens & $(p > n)$ & 7, 3 \\
+\stepid{9} & $\wedge$-intro & $((p > n) \wedge \mathrm{prime}(p))$ & 8, 4 \\
+\stepid{10} & $\exists$-intro (EXISTS) binding $q$ at $p$ & $\exists q\!:\!\mathbb{N}.\, ((q > n) \wedge \mathrm{prime}(q))$ & 9 \\
+\stepid{11} & $\exists$-elim (CHOOSE) with $p\!:\!\mathbb{N}$ & $\exists q\!:\!\mathbb{N}.\, ((q > n) \wedge \mathrm{prime}(q))$ & 2, 10 \\
+\stepid{12} & $\forall$-intro (GEN) with $n\!:\!\mathbb{N}$ & $\forall n\!:\!\mathbb{N}.\, \exists q\!:\!\mathbb{N}.\, ((q > n) \wedge \mathrm{prime}(q))$ & 11 \\
+\end{longtable}
+
+\section*{Provenance}
+The trusted base for this document is the kernel verifier $V$ (see \texttt{kernel/verify.ml}) plus the axioms listed above.
+\end{document}

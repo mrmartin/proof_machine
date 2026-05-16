@@ -49,13 +49,22 @@ let rec latex_of_term t =
         (latex_name n) (latex_of_type ty) (latex_of_term b)
   | Abs _ -> "\\langle bad abs\\rangle"
 
-and latex_name n = n
+and latex_name n = escape_underscores n
 and latex_const c =
   match c with
   | "one" -> "1"
   | "T" -> "\\top"
   | "F" -> "\\bot"
-  | _ -> "\\mathrm{" ^ c ^ "}"
+  | _ -> "\\mathrm{" ^ escape_underscores c ^ "}"
+
+and escape_underscores s =
+  let buf = Buffer.create (String.length s) in
+  String.iter (fun c ->
+    if c = '_' then Buffer.add_string buf "\\_"
+    else Buffer.add_char buf c) s;
+  Buffer.contents buf
+
+and escape_text s = escape_underscores s
 and latex_of_type ty =
   let open Kernel.Type in
   match ty with
@@ -103,9 +112,9 @@ let witness_str = function
   | W_term t -> "at $" ^ latex_of_term t ^ "$"
   | W_type ty -> "at $" ^ latex_of_type ty ^ "$"
   | W_var (n, ty) -> "with $" ^ latex_name n ^ "\\!:\\!" ^ latex_of_type ty ^ "$"
-  | W_axiom n -> "[" ^ n ^ "]"
+  | W_axiom n -> "[\\texttt{" ^ escape_text n ^ "}]"
   | W_bound_and_witness ((n, _), w) ->
-      "binding $" ^ n ^ "$ at $" ^ latex_of_term w ^ "$"
+      "binding $" ^ latex_name n ^ "$ at $" ^ latex_of_term w ^ "$"
   | W_inst _ | W_inst_type _ -> ""
 
 let premises_str = function
@@ -157,7 +166,8 @@ let render ~thm_name ~axioms ~goal ~cert oc =
     Printf.fprintf oc "The proof cites the following theory-package axioms (trusted assumptions for v0.1):\n";
     Printf.fprintf oc "\\begin{itemize}\n";
     List.iter (fun (n, t) ->
-      Printf.fprintf oc "  \\item \\textbf{%s}: $%s$\n" n (latex_of_term t)
+      Printf.fprintf oc "  \\item \\texttt{%s}: $%s$\n"
+        (escape_text n) (latex_of_term t)
     ) axioms;
     Printf.fprintf oc "\\end{itemize}\n\n"
   end;

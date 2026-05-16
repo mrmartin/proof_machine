@@ -15,6 +15,7 @@ _build/
 *.log
 *.out
 *.pdf
+!examples/**/*.pdf
 *.toc
 .merlin
 .cache/

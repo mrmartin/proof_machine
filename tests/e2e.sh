@@ -59,6 +59,22 @@ else
   die "renderer output missing theorem"
 fi
 
+# -- 3b. pdflatex compiles the rendered .tex -------------------------------
+if command -v pdflatex > /dev/null 2>&1; then
+  ( cd "$TMP" && pdflatex -interaction=nonstopmode -halt-on-error \
+      euclid.tex > pdflatex.log 2>&1 ) || true
+  if [[ -s "$TMP/euclid.pdf" ]]; then
+    pass "pdflatex produced euclid.pdf ($(stat -c %s "$TMP/euclid.pdf") bytes)"
+    # Copy the artifact next to the source for convenience
+    cp "$TMP/euclid.pdf" examples/euclid/euclid.pdf
+    cp "$TMP/euclid.tex" examples/euclid/euclid.tex
+  else
+    die "pdflatex failed; see $TMP/pdflatex.log"
+  fi
+else
+  echo "  SKIP pdflatex not on PATH"
+fi
+
 # -- 4. Lookup cache should now hit on Euclid -----------------------------
 $PROVE --using lookup "$TMP/euclid.kf" "$TMP/euclid2.cert" > /dev/null 2>&1 \
   && pass "lookup hit after prior store" \
