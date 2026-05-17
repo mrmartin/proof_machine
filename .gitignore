@@ -27,3 +27,4 @@ __pycache__/
 # RL training artefacts — checkpoints are large binaries; logs are
 # already covered by *.log above.
 *.pkl
+*.pt

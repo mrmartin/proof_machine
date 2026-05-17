@@ -1,128 +1,110 @@
-"""
-microgpt_with_RL_hol.py — train a small GPT to find HOL proofs via REINFORCE.
+"""microgpt_with_RL_hol.py — train a small GPT to find HOL proofs via REINFORCE.
 
-Adapted from microgpt_with_RL.py (Karpathy's microgpt + RL conversion).
-The structural changes:
-  - vocab: replaced with the HOL certificate vocab (lexeme-level, 232 ids).
-  - seed prompts: HOL theorems (encoded as token sequences).
-  - validator V: grammar-aware certificate checker, with concl-alpha-match.
-  - sampling: masked by the grammar automaton so the policy can only emit
-    syntactically valid certificate prefixes.
-  - **Data-parallel rollouts**: N workers (default `cpu_count()`) each
-    sample one rollout per RL step; main averages gradients and applies
-    one Adam update.
+PyTorch port of the original scalar-autograd trainer.  Single-GPU
+training; rollouts run as a batched forward on one CUDA device with the
+kernel verifier as a CPU subprocess pool.  The RL recipe — REINFORCE +
+per-prompt EMA baseline + reward-gated entropy + grammar-masked sampling
++ kernel-verified reward + optional supervised warmup — is preserved
+from the original.
 
-Adam and the model code are otherwise untouched.
-
-Reward schedule (terminal) — configurable via env vars so we can ablate:
-   -1                                grammar didn't accept the completion
-    HOL_REWARD_WRONG_CONCL  (def 0)  valid cert, but concl ≠ prompted goal
-   +100                              valid cert AND concl alpha-equiv to goal
-   + HOL_STEP_BONUS         (def 0)  extra if cert has at least one (step …)
-
-Optional supervised warmup: HOL_WARMUP_STEPS pre-RL passes of teacher-forced
-next-token CE over (prompt + gold cert) for each seed.
-
-Files:
-  HOL_LOG_PATH   (default hol_rl_run.log)
-  HOL_CKPT_PATH  (default hol_rl_ckpt.pkl)
+Reward shape: integer codes from the OCaml verifier (-1 / 0 / 100) are
+remapped to floats (`HOL_REWARD_GRAMMAR_REJECT / _WRONG_CONCL / _CORRECT`,
+defaults -1.0 / 0.0 / 1000.0) so "proves the prompted theorem" dominates
+"kernel-verifies but proves something else" by a 1000-unit margin.  The
+advantage is normalised by `REWARD_CORRECT` before the policy-gradient
+loss so the wider gap doesn't blow up the gradient magnitude.
 """
 
 import os
-import math
-import random
 import sys
 import time
-import pickle
+import random
 import subprocess
-import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "tokenizer", "python"))
 import hol_tokenizer as T
 
 # ---------------------------------------------------------------------------
-# Configuration via env vars.
+# Configuration via env vars (names preserved from the original).
 # ---------------------------------------------------------------------------
 LOG_PATH       = os.environ.get("HOL_LOG_PATH",  os.path.join(os.path.dirname(__file__), "hol_rl_run.log"))
-CKPT_PATH      = os.environ.get("HOL_CKPT_PATH", os.path.join(os.path.dirname(__file__), "hol_rl_ckpt.pkl"))
+CKPT_PATH      = os.environ.get("HOL_CKPT_PATH", os.path.join(os.path.dirname(__file__), "hol_rl_ckpt.pt"))
 NUM_STEPS      = int(os.environ.get("HOL_NUM_STEPS",  "8000"))
 LOG_EVERY      = int(os.environ.get("HOL_LOG_EVERY",  "20"))
 CKPT_EVERY     = int(os.environ.get("HOL_CKPT_EVERY", "200"))
-N_WORKERS      = int(os.environ.get("HOL_NUM_WORKERS", "0")) or os.cpu_count()
 WARMUP_STEPS   = int(os.environ.get("HOL_WARMUP_STEPS", "0"))
-REWARD_WRONG_CONCL = float(os.environ.get("HOL_REWARD_WRONG_CONCL", "0"))
-STEP_BONUS         = float(os.environ.get("HOL_STEP_BONUS", "0"))
-ENTROPY_BETA       = float(os.environ.get("HOL_ENTROPY_BETA", "0.0"))
-VERIFIER_BIN       = os.environ.get(
+ENTROPY_BETA   = float(os.environ.get("HOL_ENTROPY_BETA", "0.0"))
+USE_KERNEL_VERIFY = int(os.environ.get("HOL_USE_KERNEL_VERIFY", "1"))
+VERIFIER_BIN   = os.environ.get(
     "HOL_VERIFIER_BIN",
     os.path.join(os.path.dirname(__file__), "_build", "default", "bin", "verify_tokens.exe"),
 )
-USE_KERNEL_VERIFY  = int(os.environ.get("HOL_USE_KERNEL_VERIFY", "1"))
 
-log_f = open(LOG_PATH, "a", buffering=1)
-def log(msg):
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    print(line)
-    log_f.write(line + "\n")
+# New: reward scale (the gap between "proved the theorem" and "verified
+# the wrong theorem" used to be 100; now 1000 by default).
+REWARD_GRAMMAR_REJECT = float(os.environ.get("HOL_REWARD_GRAMMAR_REJECT", "-1.0"))
+REWARD_WRONG_CONCL    = float(os.environ.get("HOL_REWARD_WRONG_CONCL",    "0.0"))
+REWARD_CORRECT        = float(os.environ.get("HOL_REWARD_CORRECT",        "1000.0"))
+STEP_BONUS            = float(os.environ.get("HOL_STEP_BONUS", "0"))   # python-V fallback only
 
-# ---------------------------------------------------------------------------
-# Model hyperparams (architecture untouched).
-# ---------------------------------------------------------------------------
-n_layer = 1
-n_embd = 12
-n_head = 4
+# Rollout / batching.  HOL_NUM_WORKERS = rollouts per Adam step (single
+# batched forward).  Bigger amortises kernel-launch overhead.
+N_ROLLOUTS_PER_STEP = int(os.environ.get("HOL_NUM_WORKERS", "128"))
+max_gen_tokens      = int(os.environ.get("HOL_MAX_GEN", "80"))
+block_size          = int(os.environ.get("HOL_BLOCK_SIZE", "128"))
+
+# Model size (new envs; default 4 layers / 128 dim ≈ 850K params).
+n_layer = int(os.environ.get("HOL_N_LAYER", "4"))
+n_embd  = int(os.environ.get("HOL_N_EMBD",  "128"))
+n_head  = int(os.environ.get("HOL_N_HEAD",  "4"))
+assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
 head_dim = n_embd // n_head
-block_size = int(os.environ.get("HOL_BLOCK_SIZE", "96"))
-max_gen_tokens = int(os.environ.get("HOL_MAX_GEN", "80"))
 vocab_size = T.VOCAB_SIZE
 BOS = T.BOS
 EOS = T.EOS
 
-# ---------------------------------------------------------------------------
-# Autograd Value (identical to microgpt.py).
-# ---------------------------------------------------------------------------
-class Value:
-    __slots__ = ('data', 'grad', '_children', '_local_grads')
-    def __init__(self, data, children=(), local_grads=()):
-        self.data = data; self.grad = 0
-        self._children = children; self._local_grads = local_grads
-    def __add__(self, other):
-        other = other if isinstance(other, Value) else Value(other)
-        return Value(self.data + other.data, (self, other), (1, 1))
-    def __mul__(self, other):
-        other = other if isinstance(other, Value) else Value(other)
-        return Value(self.data * other.data, (self, other), (other.data, self.data))
-    def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
-    def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
-    def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
-    def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
-    def __neg__(self): return self * -1
-    def __radd__(self, other): return self + other
-    def __sub__(self, other): return self + (-other)
-    def __rsub__(self, other): return other + (-self)
-    def __rmul__(self, other): return self * other
-    def __truediv__(self, other): return self * other**-1
-    def __rtruediv__(self, other): return other * self**-1
-    def backward(self):
-        topo = []; visited = set()
-        def build_topo(v):
-            if id(v) not in visited:
-                visited.add(id(v))
-                for child in v._children: build_topo(child)
-                topo.append(v)
-        build_topo(self)
-        self.grad = 1
-        for v in reversed(topo):
-            for child, local_grad in zip(v._children, v._local_grads):
-                child.grad += local_grad * v.grad
+LR = float(os.environ.get("HOL_LR", "1e-3"))
+
+# Which CUDA device to use (defaults to 0).
+CUDA_DEVICE = int(os.environ.get("HOL_CUDA_DEVICE", "0"))
 
 # ---------------------------------------------------------------------------
-# Seeds.
+# Logging.
+# ---------------------------------------------------------------------------
+log_f = None
+def open_log():
+    global log_f
+    log_f = open(LOG_PATH, "a", buffering=1)
+
+def log(msg):
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    if log_f is not None:
+        log_f.write(line + "\n")
+
+# ---------------------------------------------------------------------------
+# Device setup.
+# ---------------------------------------------------------------------------
+def setup_device():
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    torch.cuda.set_device(CUDA_DEVICE)
+    return torch.device(f"cuda:{CUDA_DEVICE}")
+
+# ---------------------------------------------------------------------------
+# Seeds (preserved from the original trainer).
 # ---------------------------------------------------------------------------
 NAT  = T.nat_ty()
 BOOL = T.bool_ty()
 
-def G_refl(name):     v = T.mk_var(name, NAT);  return T.mk_eq(v, v)
+def G_refl(name):      v = T.mk_var(name, NAT);  return T.mk_eq(v, v)
 def G_refl_bool(name): v = T.mk_var(name, BOOL); return T.mk_eq(v, v)
 def G_imp_self(name):  p = T.mk_var(name, BOOL); return T.mk_imp(p, p)
 
@@ -137,16 +119,14 @@ SEEDS = [
 ]
 
 def gold_cert_for(label, goal):
-    """Hand-built kernel-valid cert that proves `goal`.  Used for the
-    supervised warmup (tweak #3)."""
     if label.startswith("refl_"):
-        x = goal[2]  # goal = mk_eq(x, x) = ("Comb", ("Comb", "=", x), x)
+        x = goal[2]
         return T.Cert(
             steps=[T.Step(1, "REFL", ("term", x), [])],
             concl=goal,
         )
     if label.startswith("imp_"):
-        p = goal[2]  # goal = mk_imp(p, p) = ("Comb", ("Comb", "==>", p), p)
+        p = goal[2]
         return T.Cert(
             steps=[
                 T.Step(1, "ASSUME", ("term", p), []),
@@ -157,21 +137,12 @@ def gold_cert_for(label, goal):
     raise ValueError(f"no gold cert for {label}")
 
 # ---------------------------------------------------------------------------
-# Supervised corpus: ~1000 (goal, gold cert) pairs across distinct
-# token-patterns.  Each pattern is replicated many times — token-identical
-# instances still give SGD more updates against the same loss surface.
+# Supervised corpus (preserved verbatim from the original).
 # ---------------------------------------------------------------------------
-
 def _build_supervised_corpus():
-    """Return a list of (goal_term, gold_cert) pairs.  Each pattern is
-    instantiated multiple times to bulk up the warmup data; the model's
-    canonical-slot tokenizer means name-variation collapses to the same
-    token sequence, so what matters is the distinct token-PATTERN count
-    and how many times each gets hit by SGD."""
     nat   = NAT
     bool_ = BOOL
     ind   = T.ind_ty()
-
     out = []
 
     def refl_pair(name, ty):
@@ -210,7 +181,6 @@ def _build_supervised_corpus():
     NAMES = ["a", "b", "c", "p", "q", "x", "y", "z", "n", "m", "k", "u", "v", "w"]
     per_pattern = int(os.environ.get("HOL_CORPUS_PER_PATTERN", "200"))
 
-    # 6 distinct token patterns × per_pattern replicas each.
     for ty in (nat, bool_, ind):
         for _ in range(per_pattern):
             out.append(refl_pair(NAMES[len(out) % len(NAMES)], ty))
@@ -230,8 +200,6 @@ def _build_supervised_corpus():
 
 CORPUS = _build_supervised_corpus()
 
-# Pre-encode every corpus entry once.  goal_toks for the prompt,
-# cert_toks for the supervised target.
 ENCODED_CORPUS = []
 for g, c in CORPUS:
     gt, _ = T.encode_term_only(g)
@@ -239,8 +207,6 @@ for g, c in CORPUS:
     if len(gt) + len(ct) + 3 <= block_size:
         ENCODED_CORPUS.append((gt, ct))
 
-# Build prompt tokens + gold cert tokens for the TEST seeds (used by RL
-# phase + final inference, unchanged from before).
 encoded_goals = []
 for label, goal, _ in SEEDS:
     goal_toks, _ = T.encode_term_only(goal)
@@ -249,105 +215,7 @@ for label, goal, _ in SEEDS:
     encoded_goals.append((label, goal, goal_toks, cert_toks))
 
 # ---------------------------------------------------------------------------
-# Worker globals — set by _worker_init in each Pool process.
-# ---------------------------------------------------------------------------
-_W_state_dict = None
-_W_params = None
-_W_n_params = None
-_W_verifier = None       # subprocess.Popen running the OCaml verify_tokens.exe
-
-def _build_model():
-    """Build the model structure with placeholder zero weights.  Used in
-    workers (and as main's structure)."""
-    matrix = lambda nout, nin: [[Value(0.0) for _ in range(nin)] for _ in range(nout)]
-    sd = {
-        'wte':     matrix(vocab_size, n_embd),
-        'wpe':     matrix(block_size, n_embd),
-        'lm_head': matrix(vocab_size, n_embd),
-    }
-    for i in range(n_layer):
-        sd[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
-        sd[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
-        sd[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
-        sd[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
-        sd[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
-        sd[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
-    flat = [p for mat in sd.values() for row in mat for p in row]
-    return sd, flat
-
-def _gpt(sd, token_id, pos_id, keys, values):
-    tok_emb = sd['wte'][token_id]
-    pos_emb = sd['wpe'][pos_id]
-    x = [t + p for t, p in zip(tok_emb, pos_emb)]
-    def rmsnorm(x):
-        ms = sum(xi * xi for xi in x) / len(x)
-        scale = (ms + 1e-5) ** -0.5
-        return [xi * scale for xi in x]
-    def linear(x, w):
-        return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
-    def softmax(logits):
-        max_val = max(val.data for val in logits)
-        exps = [(val - max_val).exp() for val in logits]
-        total = sum(exps)
-        return [e / total for e in exps]
-    x = rmsnorm(x)
-    for li in range(n_layer):
-        x_residual = x; x = rmsnorm(x)
-        q = linear(x, sd[f'layer{li}.attn_wq'])
-        k = linear(x, sd[f'layer{li}.attn_wk'])
-        v = linear(x, sd[f'layer{li}.attn_wv'])
-        keys[li].append(k); values[li].append(v)
-        x_attn = []
-        for h in range(n_head):
-            hs = h * head_dim
-            q_h = q[hs:hs+head_dim]
-            k_h = [ki[hs:hs+head_dim] for ki in keys[li]]
-            v_h = [vi[hs:hs+head_dim] for vi in values[li]]
-            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5
-                           for t in range(len(k_h))]
-            attn_weights = softmax(attn_logits)
-            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h)))
-                        for j in range(head_dim)]
-            x_attn.extend(head_out)
-        x = linear(x_attn, sd[f'layer{li}.attn_wo'])
-        x = [a + b for a, b in zip(x, x_residual)]
-        x_residual = x; x = rmsnorm(x)
-        x = linear(x, sd[f'layer{li}.mlp_fc1'])
-        x = [xi.relu() for xi in x]
-        x = linear(x, sd[f'layer{li}.mlp_fc2'])
-        x = [a + b for a, b in zip(x, x_residual)]
-    logits = linear(x, sd['lm_head'])
-    return logits
-
-def _softmax_data(logits):
-    mv = max(v.data for v in logits)
-    exps = [(v - mv).exp() for v in logits]
-    total = sum(exps)
-    return [e / total for e in exps]
-
-def sample_with_mask(logits, mask):
-    """Sample from softmax(masked logits).  Returns (tok_id, log_prob, entropy)
-    where log_prob and entropy are Value objects (autograd-aware)."""
-    valid_idx = [i for i, ok in enumerate(mask) if ok]
-    valid_logits = [logits[i] for i in valid_idx]
-    max_v = max(v.data for v in valid_logits)
-    exps = [(v - max_v).exp() for v in valid_logits]
-    total = sum(exps)
-    probs = [e / total for e in exps]
-    # entropy = -Σ p log p
-    entropy = sum(-(p * p.log()) for p in probs)
-    k = random.choices(range(len(probs)), weights=[p.data for p in probs])[0]
-    return valid_idx[k], probs[k].log(), entropy
-
-def argmax_with_mask(logits, mask):
-    best, best_v = None, -1e18
-    for i, ok in enumerate(mask):
-        if ok and logits[i].data > best_v:
-            best, best_v = i, logits[i].data
-    return best
-
-# ---------------------------------------------------------------------------
-# Validator V.
+# Validator helpers (preserved verbatim).
 # ---------------------------------------------------------------------------
 def _infer_header(toks):
     hdr = T.PoolHeader()
@@ -376,351 +244,563 @@ def _infer_header(toks):
     return hdr
 
 def has_step_block(toks):
-    """True iff `(KW_step` appears in the token list."""
     for i, t in enumerate(toks):
         if t == T.KW_STEP and i > 0 and toks[i - 1] == T.LPAREN:
             return True
     return False
 
-def _canonicalize_term(term):
-    """Rename free variables to vc0, vc1, … in order of first appearance.
-    Bound variables keep their original names (alpha_eq handles those via
-    binder-depth indexing).  This lets us compare two terms that are
-    structurally identical but use different free-var names."""
-    rename = {}
-    def aux(t, bound):
-        if t[0] == "Var":
-            n, ty = t[1], t[2]
-            if n in bound:
-                return t
-            if n not in rename:
-                rename[n] = f"vc{len(rename)}"
-            return ("Var", rename[n], ty)
-        if t[0] == "Const":
-            return t
-        if t[0] == "Comb":
-            return ("Comb", aux(t[1], bound), aux(t[2], bound))
-        if t[0] == "Abs":
-            return ("Abs", t[1], t[2], aux(t[3], bound | {t[1]}))
-        return t
-    return aux(term, set())
+# ---------------------------------------------------------------------------
+# PDA memoisation.
+#
+# The grammar PDA has a small number of reachable states (~ low hundreds).
+# Without caching, `T.valid_next_mask` allocates a fresh [False]*232 list
+# and walks the stack on EVERY call — ~10 µs each.  At B=32 rollouts × ~40
+# generation steps that's >10 ms of Python work per RL step on a single
+# core, which leaves the GPU idle between forwards.  Memoising both
+# `valid_next_mask` and `T.step` turns those into dict lookups (~100 ns)
+# after the first few rollouts warm the cache.
+# ---------------------------------------------------------------------------
+_ALL_TRUE_NP = np.ones(T.VOCAB_SIZE, dtype=bool)
 
-def _kernel_verify(cert_toks, goal_toks):
-    """Send cert+goal tokens to the OCaml verifier subprocess; read reward."""
-    if _W_verifier is None: return -1
-    parts = [str(len(cert_toks))] + [str(t) for t in cert_toks]
-    parts += [str(len(goal_toks))] + [str(t) for t in goal_toks]
-    req = " ".join(parts) + "\n"
-    try:
-        _W_verifier.stdin.write(req)
-        _W_verifier.stdin.flush()
-        line = _W_verifier.stdout.readline()
-        if not line: return -1
-        return int(line.strip())
-    except Exception:
-        return -1
+_mask_cache: dict = {}
+def cached_valid_next_mask_np(state):
+    key = tuple(state)
+    m = _mask_cache.get(key)
+    if m is None:
+        m = np.asarray(T.valid_next_mask(state), dtype=bool)
+        _mask_cache[key] = m
+    return m
 
-def V_python(goal, gen_tokens):
-    """Pure-Python V (kept as fallback when kernel verifier unavailable).
-    Returns -1 on grammar reject, REWARD_WRONG_CONCL on bad concl, +100 on match,
-    plus an optional STEP_BONUS if the cert has a step block."""
+_NO_SUCH = object()
+_step_cache: dict = {}
+def cached_step(state, tok):
+    key = (tuple(state), tok)
+    ns = _step_cache.get(key, _NO_SUCH)
+    if ns is _NO_SUCH:
+        ns = T.step(state, tok)
+        _step_cache[key] = ns
+    return ns
+
+_accept_cache: dict = {}
+def cached_is_accepting(state):
+    key = tuple(state)
+    v = _accept_cache.get(key)
+    if v is None:
+        v = bool(T.is_accepting(state))
+        _accept_cache[key] = v
+    return v
+
+# ---------------------------------------------------------------------------
+# Reward remap: verifier code -> float.
+# ---------------------------------------------------------------------------
+def remap_reward(code: int) -> float:
+    if code == 100: return REWARD_CORRECT
+    if code == 0:   return REWARD_WRONG_CONCL
+    return REWARD_GRAMMAR_REJECT  # -1 or any other error
+
+def V_python(goal, gen_tokens) -> float:
+    """Pure-Python fallback validator, used when the kernel verifier
+    subprocess is unavailable.  Returns the same remapped reward scale."""
     s = T.initial_state()
     for t in gen_tokens:
         ns = T.step(s, t)
-        if ns is None: return -1.0
+        if ns is None: return REWARD_GRAMMAR_REJECT
         s = ns
     if not T.is_accepting(s):
-        return -1.0
+        return REWARD_GRAMMAR_REJECT
     bonus = STEP_BONUS if has_step_block(gen_tokens) else 0.0
     try:
         hdr = _infer_header(gen_tokens)
         cert = T.decode_cert(hdr, gen_tokens)
     except Exception:
         return REWARD_WRONG_CONCL + bonus
-    base = 100.0 if T.alpha_eq(cert.concl, goal) else REWARD_WRONG_CONCL
-    return base + bonus
-
-def V(goal, goal_toks, gen_tokens):
-    """Score a completion.  Uses the OCaml kernel verifier when available
-    (kills the zero-step cheat), else the Python fallback."""
-    if USE_KERNEL_VERIFY and _W_verifier is not None:
-        return float(_kernel_verify(gen_tokens, goal_toks))
-    return V_python(goal, gen_tokens)
+    if T.alpha_eq(cert.concl, goal):
+        return REWARD_CORRECT + bonus
+    return REWARD_WRONG_CONCL + bonus
 
 # ---------------------------------------------------------------------------
-# Worker entry-points.
+# Kernel verifier subprocess pool.
 # ---------------------------------------------------------------------------
-def _worker_init():
-    global _W_state_dict, _W_params, _W_n_params, _W_verifier
-    _W_state_dict, _W_params = _build_model()
-    _W_n_params = len(_W_params)
-    if USE_KERNEL_VERIFY and os.path.exists(VERIFIER_BIN):
+class Verifier:
+    def __init__(self, bin_path):
+        self.bin_path = bin_path
+        self.p = subprocess.Popen(
+            [bin_path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=1, universal_newlines=True,
+        )
+
+    def score(self, cert_toks, goal_toks) -> int:
         try:
-            _W_verifier = subprocess.Popen(
-                [VERIFIER_BIN],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=1, universal_newlines=True,
-            )
+            parts = [str(len(cert_toks))] + [str(t) for t in cert_toks]
+            parts += [str(len(goal_toks))] + [str(t) for t in goal_toks]
+            req = " ".join(parts) + "\n"
+            self.p.stdin.write(req)
+            self.p.stdin.flush()
+            line = self.p.stdout.readline()
+            if not line:
+                return -1
+            return int(line.strip())
         except Exception:
-            _W_verifier = None
+            return -1
 
-def _apply_params_data(params_data):
-    for p, d in zip(_W_params, params_data):
-        p.data = d
-        p.grad = 0
+    def close(self):
+        try:
+            if self.p.stdin: self.p.stdin.close()
+            self.p.terminate()
+            self.p.wait(timeout=2.0)
+        except Exception:
+            try: self.p.kill()
+            except Exception: pass
 
-def _worker_rollout(args):
-    """Run one rollout.  Returns (grads_of_full_loss, reward, gen_len).
+class VerifierPool:
+    def __init__(self, n, bin_path):
+        self.n = max(1, n)
+        self.verifiers = [Verifier(bin_path) for _ in range(self.n)]
+        self.exec = ThreadPoolExecutor(max_workers=self.n)
 
-    The full loss combines policy-gradient and entropy regularisation:
-        loss = -advantage * Σ log π(a_t | s_<t)  -  β · Σ H(π_t)
-    Worker computes its own advantage from `baseline` (passed in) and runs
-    a single backward.  Main just averages the resulting gradients."""
-    params_data, goal, goal_toks, baseline, rng_seed = args
-    _apply_params_data(params_data)
-    random.seed(rng_seed)
-    prompt = [BOS] + list(goal_toks) + [BOS]
-    if len(prompt) >= block_size - 4:
-        return [0.0] * _W_n_params, -1.0, 0
-    keys = [[] for _ in range(n_layer)]; values = [[] for _ in range(n_layer)]
-    logits = None
-    for pos_id, tok in enumerate(prompt):
-        logits = _gpt(_W_state_dict, tok, pos_id, keys, values)
-    grammar_state = T.initial_state()
-    log_probs, entropies, generated = [], [], []
-    pos, gen_count = len(prompt), 0
-    while pos < block_size and gen_count < max_gen_tokens:
-        mask = T.valid_next_mask(grammar_state)
-        sampled, lp, ent = sample_with_mask(logits, mask)
-        log_probs.append(lp); entropies.append(ent); generated.append(sampled)
-        ns = T.step(grammar_state, sampled)
-        if ns is None: break
-        grammar_state = ns
-        gen_count += 1
-        if T.is_accepting(grammar_state): break
-        if pos >= block_size - 1 or gen_count >= max_gen_tokens: break
-        logits = _gpt(_W_state_dict, sampled, pos, keys, values)
-        pos += 1
-    reward = V(goal, goal_toks, generated)
-    if log_probs:
-        advantage = reward - baseline
-        # Apply entropy bonus only when this rollout didn't succeed.  This
-        # keeps solved rollouts (R≈+100) from drifting via entropy pressure
-        # — only the rollouts that need exploration carry the H term.
-        eff_beta = ENTROPY_BETA if reward < 50.0 else 0.0
-        loss = (-advantage) * sum(log_probs) + (-eff_beta) * sum(entropies)
-        loss.backward()
-        grads = [p.grad for p in _W_params]
-    else:
-        grads = [0.0] * _W_n_params
-    return grads, reward, len(generated)
+    def score_many(self, jobs):
+        """jobs: list of (cert_toks, goal_toks).  Returns list of int codes
+        in the same order.  Each verifier subprocess is owned by exactly
+        one thread for the duration of the call so stdin/stdout reads
+        never interleave on the same pipe."""
+        n = self.n
+        buckets = [[] for _ in range(n)]
+        for i, (c, g) in enumerate(jobs):
+            buckets[i % n].append((i, c, g))
+        results = [0] * len(jobs)
 
-def _worker_warmup(args):
-    """Teacher-forced CE on (prompt + gold cert).  Returns grads, avg log-prob."""
-    params_data, goal_toks, cert_toks = args
-    _apply_params_data(params_data)
-    prompt = [BOS] + list(goal_toks) + [BOS]
-    target = list(cert_toks) + [EOS]
-    full_seq = prompt + target
-    if len(full_seq) >= block_size:
-        return [0.0] * _W_n_params, 0.0
-    keys = [[] for _ in range(n_layer)]; values = [[] for _ in range(n_layer)]
-    total_log_p = Value(0.0)
-    n_terms = 0
-    # We want to predict full_seq[i+1] given full_seq[:i+1].  Loss is over
-    # the completion portion (positions >= len(prompt) - 1).
-    for pos in range(len(full_seq) - 1):
-        logits = _gpt(_W_state_dict, full_seq[pos], pos, keys, values)
-        nxt = full_seq[pos + 1]
-        if pos < len(prompt) - 1:
+        def run_bucket(v_idx):
+            v = self.verifiers[v_idx]
+            for orig_i, c, g in buckets[v_idx]:
+                results[orig_i] = v.score(c, g)
+
+        futs = [self.exec.submit(run_bucket, v_idx) for v_idx in range(n)]
+        for f in futs: f.result()
+        return results
+
+    def close(self):
+        for v in self.verifiers:
+            v.close()
+        self.exec.shutdown(wait=False)
+
+# ---------------------------------------------------------------------------
+# Model.
+# ---------------------------------------------------------------------------
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+    def forward(self, x):
+        ms = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(ms + self.eps) * self.weight
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+        self.wq = nn.Linear(n_embd, n_embd, bias=False)
+        self.wk = nn.Linear(n_embd, n_embd, bias=False)
+        self.wv = nn.Linear(n_embd, n_embd, bias=False)
+        self.wo = nn.Linear(n_embd, n_embd, bias=False)
+
+    def forward(self, x, kv_cache=None):
+        B, Tlen, C = x.shape
+        q = self.wq(x).view(B, Tlen, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.wk(x).view(B, Tlen, self.n_head, self.head_dim).transpose(1, 2)
+        v = self.wv(x).view(B, Tlen, self.n_head, self.head_dim).transpose(1, 2)
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        is_causal = (kv_cache is None and Tlen > 1)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        out = out.transpose(1, 2).contiguous().view(B, Tlen, C)
+        return self.wo(out), (k, v)
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        self.ln1 = RMSNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head)
+        self.ln2 = RMSNorm(n_embd)
+        self.fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
+        self.fc2 = nn.Linear(4 * n_embd, n_embd, bias=False)
+
+    def forward(self, x, kv_cache=None):
+        a, new_kv = self.attn(self.ln1(x), kv_cache=kv_cache)
+        x = x + a
+        h = self.fc1(self.ln2(x))
+        h = F.relu(h)
+        x = x + self.fc2(h)
+        return x, new_kv
+
+class MicroGPT(nn.Module):
+    def __init__(self, vocab_size, n_embd, n_head, n_layer, block_size):
+        super().__init__()
+        self.block_size = block_size
+        self.n_layer = n_layer
+        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.wpe = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.ModuleList([Block(n_embd, n_head) for _ in range(n_layer)])
+        self.ln_f = RMSNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def forward(self, ids, kv_caches=None, start_pos=0):
+        """Returns (logits_last (B, V), new_kv_caches).
+        - prefill: ids=(B, P), kv_caches=None, start_pos=0.
+        - step:    ids=(B, 1), kv_caches=prev list, start_pos=position of ids."""
+        B, Tlen = ids.shape
+        pos = torch.arange(start_pos, start_pos + Tlen, device=ids.device)
+        x = self.wte(ids) + self.wpe(pos)[None, :, :]
+        new_caches = []
+        for i, block in enumerate(self.blocks):
+            kv = kv_caches[i] if kv_caches is not None else None
+            x, new_kv = block(x, kv_cache=kv)
+            new_caches.append(new_kv)
+        x = self.ln_f(x)
+        return self.lm_head(x[:, -1, :]), new_caches
+
+    def forward_seq(self, ids):
+        """Full-sequence forward returning logits at every position
+        (used for supervised warmup CE)."""
+        B, Tlen = ids.shape
+        pos = torch.arange(0, Tlen, device=ids.device)
+        x = self.wte(ids) + self.wpe(pos)[None, :, :]
+        for block in self.blocks:
+            x, _ = block(x, kv_cache=None)
+        x = self.ln_f(x)
+        return self.lm_head(x)
+
+# ---------------------------------------------------------------------------
+# Rollout: B grammar-masked autoregressive samples on the same prompt.
+# ---------------------------------------------------------------------------
+def rollout(model, prompt_toks, B, device):
+    V = vocab_size
+    prompt_ids = torch.tensor(prompt_toks, dtype=torch.long, device=device)
+    P = prompt_ids.shape[0]
+    if P >= block_size:
+        return (torch.zeros(B, device=device), torch.zeros(B, device=device),
+                [[] for _ in range(B)])
+    ids = prompt_ids.unsqueeze(0).expand(B, -1).contiguous()
+    logits_last, kv = model(ids, kv_caches=None, start_pos=0)
+
+    states = [T.initial_state() for _ in range(B)]
+    done = [False] * B
+    logp_sum = torch.zeros(B, device=device)
+    ent_sum  = torch.zeros(B, device=device)
+    generated = [[] for _ in range(B)]
+    # Reusable CPU buffers to avoid per-step allocations.
+    mask_np = np.empty((B, V), dtype=bool)
+    live_np = np.zeros(B, dtype=np.float32)
+
+    max_iters = min(max_gen_tokens, block_size - P)
+    for t in range(max_iters):
+        for i in range(B):
+            if done[i]:
+                mask_np[i] = _ALL_TRUE_NP
+                live_np[i] = 0.0
+                continue
+            m = cached_valid_next_mask_np(states[i])
+            if not m.any():
+                done[i] = True
+                mask_np[i] = _ALL_TRUE_NP
+                live_np[i] = 0.0
+            else:
+                mask_np[i] = m
+                live_np[i] = 1.0
+        mask = torch.from_numpy(mask_np).to(device, non_blocking=True)
+        live_t = torch.from_numpy(live_np).to(device, non_blocking=True)
+
+        masked = logits_last.masked_fill(~mask, float('-inf'))
+        log_p = F.log_softmax(masked, dim=-1)
+        p     = log_p.exp()
+        # Safe entropy: replace log_p with 0 at masked positions so the
+        # backward through (p * log_p) doesn't see 0 * -inf = NaN.
+        log_p_safe = torch.where(mask, log_p, torch.zeros_like(log_p))
+        H     = -(p * log_p_safe).sum(-1)
+        sampled = torch.multinomial(p.detach(), num_samples=1).squeeze(-1)
+        logp_t  = log_p.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+        logp_sum = logp_sum + logp_t * live_t
+        ent_sum  = ent_sum  + H      * live_t
+
+        sampled_cpu = sampled.tolist()
+        for i in range(B):
+            if done[i]:
+                continue
+            ns = cached_step(states[i], sampled_cpu[i])
+            if ns is None:
+                done[i] = True
+                continue
+            states[i] = ns
+            generated[i].append(sampled_cpu[i])
+            if cached_is_accepting(ns) or len(generated[i]) >= max_gen_tokens:
+                done[i] = True
+        if all(done):
+            break
+        if t + 1 >= max_iters:
+            break
+        logits_last, kv = model(sampled.unsqueeze(-1), kv_caches=kv, start_pos=P + t)
+
+    return logp_sum, ent_sum, generated
+
+# ---------------------------------------------------------------------------
+# Greedy inference (end-of-run summary).
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def greedy_inference(model, device):
+    model.eval()
+    for label, goal, goal_toks, _ct in encoded_goals:
+        prompt = [BOS] + list(goal_toks) + [BOS]
+        prompt_ids = torch.tensor(prompt, dtype=torch.long, device=device).unsqueeze(0)
+        P = prompt_ids.shape[1]
+        if P >= block_size:
+            log(f"  inference {label:14s} prompt too long")
             continue
-        probs = _softmax_data(logits)
-        total_log_p = total_log_p + probs[nxt].log()
-        n_terms += 1
-    if n_terms == 0:
-        return [0.0] * _W_n_params, 0.0
-    loss = -total_log_p
-    loss.backward()
-    grads = [p.grad for p in _W_params]
-    return grads, total_log_p.data / max(1, n_terms)
+        logits_last, kv = model(prompt_ids, kv_caches=None, start_pos=0)
+        state = T.initial_state()
+        out = []
+        max_iters = min(max_gen_tokens, block_size - P)
+        for t in range(max_iters):
+            row = cached_valid_next_mask_np(state)
+            mask = torch.from_numpy(row[None, :]).to(device, non_blocking=True)
+            masked = logits_last.masked_fill(~mask, float('-inf'))
+            sampled = int(masked.argmax(-1).item())
+            ns = cached_step(state, sampled)
+            if ns is None: break
+            state = ns
+            out.append(sampled)
+            if cached_is_accepting(ns): break
+            if t + 1 >= max_iters: break
+            ids = torch.tensor([[sampled]], dtype=torch.long, device=device)
+            logits_last, kv = model(ids, kv_caches=kv, start_pos=P + t)
+        r = V_python(goal, out)
+        log(f"  inference {label:14s} gen-len {len(out):3d} V={r:+.1f}")
+    model.train()
+
+# ---------------------------------------------------------------------------
+# Supervised warmup.
+# ---------------------------------------------------------------------------
+class WarmupDataset(Dataset):
+    def __init__(self, encoded_corpus, block_size):
+        self.items = []
+        for gt, ct in encoded_corpus:
+            ids = [BOS] + list(gt) + [BOS] + list(ct) + [EOS]
+            if len(ids) > block_size: continue
+            prompt_end = 1 + len(gt) + 1  # index of the second BOS
+            input_ids = ids[:-1]
+            target_ids = ids[1:]
+            mask = [1.0 if i >= (prompt_end - 1) else 0.0 for i in range(len(target_ids))]
+            self.items.append((input_ids, target_ids, mask))
+    def __len__(self): return len(self.items)
+    def __getitem__(self, i): return self.items[i]
+
+def warmup_collate(batch):
+    L = max(len(x[0]) for x in batch)
+    inps = torch.zeros(len(batch), L, dtype=torch.long)
+    tgts = torch.zeros(len(batch), L, dtype=torch.long)
+    msks = torch.zeros(len(batch), L, dtype=torch.float)
+    for i, (a, b, m) in enumerate(batch):
+        n = len(a)
+        inps[i, :n] = torch.tensor(a, dtype=torch.long)
+        tgts[i, :n] = torch.tensor(b, dtype=torch.long)
+        msks[i, :n] = torch.tensor(m, dtype=torch.float)
+    return inps, tgts, msks
+
+def run_warmup(model, optimizer, device):
+    ds = WarmupDataset(ENCODED_CORPUS, block_size)
+    if len(ds) == 0:
+        log("warmup: empty dataset, skipping")
+        return
+    batch_size = max(1, min(32, len(ds)))
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                        collate_fn=warmup_collate, num_workers=0,
+                        pin_memory=True, drop_last=False)
+    log(f"=== Warmup: {WARMUP_STEPS} steps over {len(ds)} examples (bs={batch_size}) ===")
+    t_start = time.time()
+    step_count = 0
+    while step_count < WARMUP_STEPS:
+        for inps, tgts, msks in loader:
+            if step_count >= WARMUP_STEPS: break
+            inps = inps.to(device, non_blocking=True)
+            tgts = tgts.to(device, non_blocking=True)
+            msks = msks.to(device, non_blocking=True)
+            logits = model.forward_seq(inps)
+            V_ = logits.shape[-1]
+            ce = F.cross_entropy(logits.reshape(-1, V_), tgts.reshape(-1), reduction='none')
+            ce = ce * msks.reshape(-1)
+            denom = msks.sum().clamp_min(1.0)
+            loss = ce.sum() / denom
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            step_count += 1
+            if step_count % max(1, WARMUP_STEPS // 20) == 0:
+                log(f"  warmup {step_count:4d}/{WARMUP_STEPS}  avg-log-p={-loss.item():+.3f}")
+    log(f"=== Warmup done ({time.time()-t_start:.1f}s) ===")
+
+# ---------------------------------------------------------------------------
+# Checkpoint.
+# ---------------------------------------------------------------------------
+def save_ckpt(path, model, optimizer, baselines, step):
+    ckpt = {
+        'step': step,
+        'model':     model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'baselines': dict(baselines),
+        'config': {
+            'n_layer': n_layer, 'n_embd': n_embd, 'n_head': n_head,
+            'block_size': block_size, 'vocab_size': vocab_size,
+        },
+    }
+    torch.save(ckpt, path)
+    log(f"checkpoint saved at step {step}")
+
+def load_ckpt(path, model, optimizer, device):
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        if not isinstance(ckpt, dict) or 'model' not in ckpt:
+            raise ValueError("ckpt missing 'model' key (probably old scalar-Value pickle)")
+    except Exception as e:
+        log(f"ERROR: could not load {path}: {e}")
+        log("Old scalar-Value pickles (R1-R5 hol_rl_r*.pkl) are not "
+            "resumable by the PyTorch trainer. Rename or delete and start fresh.")
+        raise
+    model.load_state_dict(ckpt['model'])
+    optimizer.load_state_dict(ckpt['optimizer'])
+    log(f"resumed from checkpoint at step {ckpt['step']}")
+    return ckpt['step'], dict(ckpt['baselines'])
 
 # ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
 def main():
-    log(f"=== microgpt_with_RL_hol starting (pid={os.getpid()}) ===")
+    device = setup_device()
+    open_log()
+    log(f"=== microgpt_with_RL_hol PyTorch port (pid={os.getpid()}) ===")
+    log(f"device={device}")
     log(f"NUM_STEPS={NUM_STEPS}  LOG_EVERY={LOG_EVERY}  CKPT_EVERY={CKPT_EVERY}")
-    log(f"N_WORKERS={N_WORKERS}  WARMUP_STEPS={WARMUP_STEPS}")
-    log(f"REWARD_WRONG_CONCL={REWARD_WRONG_CONCL}  STEP_BONUS={STEP_BONUS}")
-    log(f"vocab_size={vocab_size}  block_size={block_size}  max_gen_tokens={max_gen_tokens}")
+    log(f"WARMUP_STEPS={WARMUP_STEPS}  ENTROPY_BETA={ENTROPY_BETA}  LR={LR}")
+    log(f"reward shape: reject={REWARD_GRAMMAR_REJECT}  wrong={REWARD_WRONG_CONCL}  correct={REWARD_CORRECT}")
+    log(f"model: n_layer={n_layer} n_embd={n_embd} n_head={n_head} block_size={block_size}")
+    log(f"vocab={vocab_size} max_gen={max_gen_tokens}  rollouts/step={N_ROLLOUTS_PER_STEP}")
     log(f"#seeds: {len(SEEDS)}")
     for label, _, gt, ct in encoded_goals:
         log(f"  {label}: prompt-toks={len(gt)} gold-cert-toks={len(ct)}")
 
-    state_dict, params = _build_model()
-    # Re-init weights with proper distribution (workers do the same).
-    rng = random.Random(42)
-    for mat in state_dict.values():
-        for row in mat:
-            for v in row: v.data = rng.gauss(0, 0.08)
-    log(f"num params: {len(params)}")
+    torch.manual_seed(42)
+    random.seed(42)
 
-    # Adam state.
-    learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
-    m_state  = [0.0] * len(params)
-    v_state  = [0.0] * len(params)
-    start_step = 0
+    model = MicroGPT(vocab_size, n_embd, n_head, n_layer, block_size).to(device)
+    log(f"num params: {sum(p.numel() for p in model.parameters())}")
+    # Allow TF32 on the matmul path (3090 supports it).  Big win on
+    # launch-bound autoregressive decode at small B.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # torch.compile: with mode="default" the inductor backend fuses the
+    # block ops (rmsnorm + linear + relu + linear) into a smaller number
+    # of kernels, cutting launch overhead.  This is the biggest single
+    # lever for GPU utilisation at this model size since each generation
+    # step is otherwise launching ~30 tiny kernels.  Disable with
+    # HOL_COMPILE=0 if a backend issue arises.
+    if torch.cuda.is_available() and int(os.environ.get("HOL_COMPILE", "1")):
+        try:
+            model = torch.compile(model, mode="default", dynamic=True)
+            log("torch.compile: enabled (mode=default, dynamic=True)")
+        except Exception as e:
+            log(f"torch.compile failed: {e}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.85, 0.99), eps=1e-8)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda s: max(0.0, 1 - s / max(1, NUM_STEPS)))
+
     baselines = {label: 0.0 for (label, _, _, _) in encoded_goals}
-    baseline_ema = 0.9
-
-    # Resume from checkpoint if present.
+    start_step = 0
     if os.path.exists(CKPT_PATH):
-        with open(CKPT_PATH, 'rb') as f:
-            ckpt = pickle.load(f)
-        for p, d in zip(params, ckpt['params_data']):
-            p.data = d
-        m_state[:] = ckpt['m']
-        v_state[:] = ckpt['v_buf']
-        baselines.update(ckpt['baselines'])
-        start_step = ckpt['step']
-        log(f"resumed from checkpoint at step {start_step}")
+        start_step, baselines = load_ckpt(CKPT_PATH, model, optimizer, device)
+        for _ in range(start_step):
+            scheduler.step()
 
-    def snapshot():
-        return [p.data for p in params]
+    # Use all (or nearly all) CPU cores for the verifier subprocess pool.
+    # Cap at the global rollouts/step since more verifiers than rollouts is
+    # wasted, and at 48 to avoid pathological process spawn cost.
+    n_verifiers = max(1, min(48, os.cpu_count() or 4, N_ROLLOUTS_PER_STEP))
+    vpool = VerifierPool(n_verifiers, VERIFIER_BIN) if USE_KERNEL_VERIFY else None
+    log(f"verifier pool: {n_verifiers} subprocesses" if vpool else "verifier: python fallback")
 
-    def save_ckpt(step):
-        ckpt = {
-            'step': step,
-            'params_data': snapshot(),
-            'm': m_state, 'v_buf': v_state,
-            'baselines': baselines,
-        }
-        with open(CKPT_PATH, 'wb') as f:
-            pickle.dump(ckpt, f)
-        log(f"checkpoint saved at step {step}")
-
-    def adam_step(grad, step, total=None):
-        # LR decays linearly to 0 over `total` steps; default to NUM_STEPS.
-        total = total if total is not None else NUM_STEPS
-        lr_t = learning_rate * max(0.0, 1 - step / max(1, total))
-        for i, p in enumerate(params):
-            m_state[i] = beta1 * m_state[i] + (1 - beta1) * grad[i]
-            v_state[i] = beta2 * v_state[i] + (1 - beta2) * grad[i] ** 2
-            m_hat = m_state[i] / (1 - beta1 ** (step + 1))
-            v_hat = v_state[i] / (1 - beta2 ** (step + 1))
-            p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
-
-    log(f"creating pool of {N_WORKERS} workers")
-    pool = mp.Pool(N_WORKERS, initializer=_worker_init)
-
-    # ----- Warmup (supervised, teacher-forced) -----------------------------
     if WARMUP_STEPS > 0 and start_step == 0:
-        log(f"=== Warmup: {WARMUP_STEPS} supervised steps over "
-            f"{len(ENCODED_CORPUS)} corpus examples ===")
+        run_warmup(model, optimizer, device)
+
+    threshold = (REWARD_CORRECT + REWARD_WRONG_CONCL) / 2.0
+
+    try:
         t_start = time.time()
-        rng_warm = random.Random(13)
-        for w_step in range(WARMUP_STEPS):
-            params_data = snapshot()
-            # Sample N_WORKERS distinct examples from the corpus (with
-            # replacement if the corpus is smaller than N_WORKERS).
-            n_samp = min(N_WORKERS, len(ENCODED_CORPUS))
-            picks = rng_warm.sample(range(len(ENCODED_CORPUS)), n_samp) \
-                    if len(ENCODED_CORPUS) >= n_samp else \
-                    [rng_warm.randrange(len(ENCODED_CORPUS)) for _ in range(N_WORKERS)]
-            # Pad up to N_WORKERS by re-sampling with replacement.
-            while len(picks) < N_WORKERS:
-                picks.append(rng_warm.randrange(len(ENCODED_CORPUS)))
-            args = [(params_data, ENCODED_CORPUS[i][0], ENCODED_CORPUS[i][1])
-                    for i in picks]
-            results = pool.map(_worker_warmup, args)
-            avg = [0.0] * len(params)
-            for grads, _ in results:
-                for i, g in enumerate(grads):
-                    avg[i] += g
-            avg = [g / len(results) for g in avg]
-            # Use a large `total` so warmup runs at near-constant LR.
-            adam_step(avg, w_step, total=max(NUM_STEPS, WARMUP_STEPS * 50))
-            if (w_step + 1) % max(1, WARMUP_STEPS // 20) == 0:
-                avg_lp = sum(lp for _, lp in results) / len(results)
-                log(f"  warmup {w_step+1:4d}/{WARMUP_STEPS}  avg-log-p={avg_lp:+.3f}")
-        log(f"=== Warmup done ({time.time()-t_start:.1f}s) ===")
+        last_log_t = t_start
+        for step in range(start_step, NUM_STEPS):
+            label, goal, goal_toks, _ = encoded_goals[step % len(encoded_goals)]
+            prompt_toks = [BOS] + list(goal_toks) + [BOS]
 
-    # ----- RL loop ---------------------------------------------------------
-    t_start = time.time()
-    last_log_t = t_start
-    for step in range(start_step, NUM_STEPS):
-        label, goal, goal_toks, _cert_toks = encoded_goals[step % len(encoded_goals)]
-        params_data = snapshot()
-        b = baselines[label]
-        args = [(params_data, goal, goal_toks, b, step * N_WORKERS + i) for i in range(N_WORKERS)]
-        results = pool.map(_worker_rollout, args)
+            model.train()
+            logp_sum, ent_sum, gens = rollout(
+                model, prompt_toks, N_ROLLOUTS_PER_STEP, device)
 
-        rewards = [r for _, r, _ in results]
-        gen_lens = [gl for _, _, gl in results]
-        avg_r = sum(rewards) / len(rewards)
+            if vpool is not None:
+                codes = vpool.score_many([(g, goal_toks) for g in gens])
+                rewards = [remap_reward(c) for c in codes]
+            else:
+                rewards = [V_python(goal, g) for g in gens]
+            rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
 
-        # Workers already scaled grads by -(reward - baseline) and added the
-        # -β·∂H term.  We just average across workers.
-        n = len(results)
-        avg_grad = [0.0] * len(params)
-        for (grads, _, _) in results:
-            for i, g in enumerate(grads):
-                avg_grad[i] += g / n
-        adam_step(avg_grad, step)
+            b = baselines[label]
+            adv = (rewards_t - b).detach() / max(1.0, abs(REWARD_CORRECT))
+            eff_beta = torch.where(rewards_t < threshold,
+                                   torch.full_like(rewards_t, ENTROPY_BETA),
+                                   torch.zeros_like(rewards_t))
+            loss = -(adv * logp_sum).mean() + -(eff_beta * ent_sum).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
 
-        # Update baseline with the average reward across this step's workers.
-        baselines[label] = baseline_ema * b + (1 - baseline_ema) * avg_r
+            baselines[label] = 0.9 * b + 0.1 * float(rewards_t.mean().item())
 
-        if (step + 1) % LOG_EVERY == 0:
-            now = time.time()
-            rate = LOG_EVERY / (now - last_log_t) if now > last_log_t else 0
-            last_log_t = now
-            r_min, r_max = min(rewards), max(rewards)
-            best_gen = gen_lens[rewards.index(r_max)]
-            avg_b = sum(baselines.values()) / len(baselines)
-            log(f"step {step+1:5d}/{NUM_STEPS} | {label:14s} | "
-                f"R avg {avg_r:+7.2f} (min {r_min:+6.1f}, max {r_max:+6.1f}) | "
-                f"best-gen-len {best_gen:3d} | avg-b {avg_b:+7.2f} | "
-                f"{rate:.2f} steps/s")
+            if (step + 1) % LOG_EVERY == 0:
+                now = time.time()
+                rate = LOG_EVERY / max(1e-6, (now - last_log_t))
+                last_log_t = now
+                r_min = float(rewards_t.min().item())
+                r_max = float(rewards_t.max().item())
+                r_avg = float(rewards_t.mean().item())
+                best_gen_len = max(len(g) for g in gens) if gens else 0
+                avg_b = sum(baselines.values()) / len(baselines)
+                log(f"step {step+1:5d}/{NUM_STEPS} | {label:14s} | "
+                    f"R avg {r_avg:+9.2f} (min {r_min:+9.1f}, max {r_max:+9.1f}) | "
+                    f"best-gen-len {best_gen_len:3d} | avg-b {avg_b:+9.2f} | "
+                    f"{rate:.2f} steps/s")
 
-        if (step + 1) % CKPT_EVERY == 0:
-            save_ckpt(step + 1)
+            if (step + 1) % CKPT_EVERY == 0:
+                save_ckpt(CKPT_PATH, model, optimizer, baselines, step + 1)
 
-    # ----- Inference -------------------------------------------------------
-    log("=== Inference (greedy) ===")
-    for label, goal, goal_toks, _ct in encoded_goals:
-        prompt = [BOS] + list(goal_toks) + [BOS]
-        keys = [[] for _ in range(n_layer)]; values = [[] for _ in range(n_layer)]
-        logits = None
-        for pos_id, tok in enumerate(prompt):
-            logits = _gpt(state_dict, tok, pos_id, keys, values)
-        grammar_state = T.initial_state()
-        out = []
-        pos, gen_count = len(prompt), 0
-        while pos < block_size and gen_count < max_gen_tokens:
-            mask = T.valid_next_mask(grammar_state)
-            sampled = argmax_with_mask(logits, mask)
-            if sampled is None: break
-            out.append(sampled)
-            ns = T.step(grammar_state, sampled)
-            if ns is None: break
-            grammar_state = ns
-            gen_count += 1
-            if T.is_accepting(grammar_state): break
-            if pos >= block_size - 1 or gen_count >= max_gen_tokens: break
-            logits = _gpt(state_dict, sampled, pos, keys, values)
-            pos += 1
-        # Inference runs in main; no worker subprocess.  Fall back to
-        # Python V which doesn't use kernel-verify.  Good enough for an
-        # end-of-run summary; the training reward is what we care about.
-        r = V_python(goal, out)
-        log(f"  inference {label:14s} gen-len {len(out):3d} V={r:+.1f}")
-
-    save_ckpt(NUM_STEPS)
-    log("=== run complete ===")
-    pool.close(); pool.join()
-    log_f.close()
+        log("=== Inference (greedy) ===")
+        greedy_inference(model, device)
+        save_ckpt(CKPT_PATH, model, optimizer, baselines, NUM_STEPS)
+        log("=== run complete ===")
+        if log_f is not None:
+            log_f.close()
+    finally:
+        if vpool is not None:
+            vpool.close()
 
 if __name__ == "__main__":
     main()
