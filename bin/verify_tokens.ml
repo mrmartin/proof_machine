@@ -71,43 +71,70 @@ let decode_term_array (hdr : Encode.pool_header) (toks : int array) : Term.term 
 
 (* --- One request --------------------------------------------------- *)
 
+(* Override the inferred name slots in a pool header with caller-supplied
+   names.  Slots beyond the supplied list keep their synthetic "nK"
+   placeholders.  This is the hook that lets the verifier recover the
+   original constant / axiom names that the tokeniser canonicalises away. *)
+let override_names (hdr : Encode.pool_header) (names : string list) : Encode.pool_header =
+  let names_arr = Array.of_list names in
+  let new_names = Array.copy hdr.names in
+  let n = min (Array.length names_arr) (Array.length new_names) in
+  for i = 0 to n - 1 do new_names.(i) <- names_arr.(i) done;
+  { hdr with names = new_names }
+
+(* Parse either the legacy protocol (cert_len cert_toks goal_len goal_toks)
+   or the extended one (H n_cn <cn0..> n_gn <gn0..> cert_len cert_toks ...).
+   The extended form lets the client pass the *original* NAME-pool entries
+   so that constants and axiom names round-trip through verification. *)
 let handle_request (line : string) : int =
   try
     let parts =
       String.split_on_char ' ' line
       |> List.filter (fun s -> s <> "")
-      |> List.map int_of_string
     in
     let arr = Array.of_list parts in
-    if Array.length arr < 1 then -1
-    else
-      let cert_len = arr.(0) in
-      if cert_len < 0 || cert_len + 1 + 1 > Array.length arr then -1
-      else
-        let cert_toks = Array.sub arr 1 cert_len in
-        let goal_len_idx = 1 + cert_len in
-        let goal_len = arr.(goal_len_idx) in
-        if goal_len < 0
-           || goal_len_idx + 1 + goal_len > Array.length arr
-        then -1
-        else
-          let goal_toks = Array.sub arr (goal_len_idx + 1) goal_len in
-          let cert_hdr = infer_header cert_toks in
-          let goal_hdr = infer_header goal_toks in
-          match
-            try
-              let cert = Decode.cert cert_hdr cert_toks in
-              let goal = decode_term_array goal_hdr goal_toks in
-              Some (cert, goal)
-            with _ -> None
-          with
-          | None -> -1
-          | Some (cert, goal) ->
-            (* Kernel verify the cert against ITS OWN declared concl. *)
-            (match Verify.verify cert cert.concl with
-             | Verify.Ok ->
-               if Term.alpha_eq cert.concl goal then 100 else 0
-             | Verify.Reject _ -> -1)
+    let n = Array.length arr in
+    let idx = ref 0 in
+    let pop_str () =
+      if !idx >= n then failwith "short" else
+      let s = arr.(!idx) in incr idx; s
+    in
+    let pop_int () = int_of_string (pop_str ()) in
+    let pop_names () =
+      let k = pop_int () in
+      let lst = ref [] in
+      for _ = 1 to k do lst := pop_str () :: !lst done;
+      List.rev !lst
+    in
+    let pop_toks () =
+      let k = pop_int () in
+      Array.init k (fun _ -> pop_int ())
+    in
+    let (cert_names, goal_names) =
+      if n > 0 && arr.(0) = "H" then begin
+        incr idx;  (* consume 'H' *)
+        let cn = pop_names () in
+        let gn = pop_names () in
+        (cn, gn)
+      end else ([], [])
+    in
+    let cert_toks = pop_toks () in
+    let goal_toks = pop_toks () in
+    let cert_hdr = override_names (infer_header cert_toks) cert_names in
+    let goal_hdr = override_names (infer_header goal_toks) goal_names in
+    match
+      try
+        let cert = Decode.cert cert_hdr cert_toks in
+        let goal = decode_term_array goal_hdr goal_toks in
+        Some (cert, goal)
+      with _ -> None
+    with
+    | None -> -1
+    | Some (cert, goal) ->
+      (match Verify.verify cert cert.concl with
+       | Verify.Ok ->
+         if Term.alpha_eq cert.concl goal then 100 else 0
+       | Verify.Reject _ -> -1)
   with _ -> -1
 
 (* --- Main loop ----------------------------------------------------- *)

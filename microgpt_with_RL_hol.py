@@ -224,6 +224,21 @@ def G_double_gen_imp(name_p, name_x, name_y):
     forall_outer = T.mk_forall(name_x, NAT, forall_inner)
     return T.mk_imp(p, forall_outer)
 
+# ---------------------------------------------------------------------------
+# Smallest unconditional kernel theorem the model has never seen.
+# Proves (λx:nat. x) y = y by pure BETA + INST — no declared axioms, no
+# new constants, no Putnam-style cheats.  This is "1+1=2 in spirit": the
+# minimal genuinely-unconditional non-trivial theorem in our kernel.
+# Corpus has BETA only with argument == bound variable, so the INST step
+# that retargets the lambda to a fresh `y` is genuinely OOD.
+# ---------------------------------------------------------------------------
+def G_beta_inst_identity(name_x, name_y):
+    """(λx:nat. x) y = y for fresh y, where x and y are distinct."""
+    x = T.mk_var(name_x, NAT)
+    lam = T.mk_abs(name_x, NAT, x)
+    y = T.mk_var(name_y, NAT)
+    return T.mk_eq(T.mk_comb(lam, y), y)
+
 SEEDS = [
     # Five original logical-tautology seeds.
     ("refl_x",          G_refl("x"),                       1),
@@ -250,6 +265,8 @@ SEEDS = [
     ("comp_imp",        G_comp_imp("p", "q", "r"),            8),
     ("conj_assoc",      G_conj_assoc("p", "q", "r"),          8),
     ("triple_conj_intro", G_triple_conj_intro("p", "q", "r"), 8),
+    # Unconditional kernel-only smoke seed (BETA + INST, 2 steps).
+    ("beta_inst_identity", G_beta_inst_identity("x", "y"), 2),
 ]
 
 def gold_cert_for(label, goal):
@@ -413,6 +430,22 @@ def gold_cert_for(label, goal):
             T.Step(6, "CONJ",      ("none",),            [5, 3]),  # q /\ r
             T.Step(7, "CONJ",      ("none",),            [4, 6]),  # p /\ (q /\ r)
             T.Step(8, "DISCH",     ("term", outer_left), [7]),
+        ], concl=goal)
+    if label == "beta_inst_identity":
+        # goal = (λx. x) y = y.  Extract x's name and the y var.
+        lhs = goal[1][2]                   # Comb(Abs(name_x, nat, Var(name_x, nat)), y)
+        lam = lhs[1]                       # Abs("x", nat, Var("x", nat))
+        name_x = lam[1]                    # "x"
+        x_var = T.mk_var(name_x, NAT)
+        y_var = lhs[2]                     # Var("y", nat)
+        # Step 1 BETA on (λx. x) x — argument equals bound var, so kernel
+        # accepts.  Yields ⊢ (λx. x) x = x.
+        # Step 2 INST [x ↦ y] — substitutes the free x (arg + rhs) with y;
+        # the bound x inside the lambda is unaffected.  Yields the goal.
+        bound_app = T.mk_comb(lam, x_var)
+        return T.Cert(steps=[
+            T.Step(1, "BETA", ("term", bound_app), []),
+            T.Step(2, "INST", ("inst", [(x_var, y_var)]), [1]),
         ], concl=goal)
     if label == "triple_conj_intro":
         # goal = p ==> q ==> r ==> (p /\ q /\ r)
@@ -809,12 +842,19 @@ for g, c in CORPUS:
 
 # Build prompt tokens + gold cert tokens for the TEST seeds (used by RL
 # phase + final inference, unchanged from before).
+# SEED_POOL_NAMES is a side dict mapping label → (cert_names, goal_names) —
+# the original NAME-pool entries from the encoder.  The verifier needs
+# these to recover the real constant / axiom names that canonical-slot
+# tokenisation flattens to "n0", "n1", ...  Only seeds with named
+# constants beyond the built-in connectives need non-trivial entries.
 encoded_goals = []
+SEED_POOL_NAMES = {}
 for label, goal, _ in SEEDS:
-    goal_toks, _ = T.encode_term_only(goal)
+    goal_toks, g_hdr = T.encode_term_only(goal)
     gold = gold_cert_for(label, goal)
-    cert_toks, _ = T.encode_cert(gold)
+    cert_toks, c_hdr = T.encode_cert(gold)
     encoded_goals.append((label, goal, goal_toks, cert_toks))
+    SEED_POOL_NAMES[label] = (list(c_hdr.names), list(g_hdr.names))
 
 # ---------------------------------------------------------------------------
 # Worker globals — set by _worker_init in each Pool process.

@@ -187,10 +187,21 @@ class VerifierPool:
     def _init_thread(self):
         self._tls.proc = self._spawn()
 
-    def _verify_one(self, cert_toks: List[int], goal_toks: List[int]) -> int:
+    def _verify_one(self, cert_toks, goal_toks,
+                     cert_names=None, goal_names=None) -> int:
+        """Verify a (cert, goal) pair.  If cert_names / goal_names are
+        provided, send the extended H-prefixed protocol so the verifier
+        sees the original NAME-pool entries instead of synthetic 'nK'
+        placeholders — required whenever the seed mentions registered
+        constants or named axioms."""
         proc: subprocess.Popen = self._tls.proc
-        parts = [str(len(cert_toks))] + [str(t) for t in cert_toks] \
-              + [str(len(goal_toks))] + [str(t) for t in goal_toks]
+        parts = []
+        if cert_names is not None or goal_names is not None:
+            cn = cert_names or []
+            gn = goal_names or []
+            parts += ["H", str(len(cn))] + list(cn) + [str(len(gn))] + list(gn)
+        parts += [str(len(cert_toks))] + [str(t) for t in cert_toks] \
+               + [str(len(goal_toks))] + [str(t) for t in goal_toks]
         req = " ".join(parts) + "\n"
         try:
             proc.stdin.write(req)
@@ -200,14 +211,23 @@ class VerifierPool:
                 raise RuntimeError("verifier EOF")
             return int(line.strip())
         except Exception:
-            # Restart subprocess and return -1 for this request.
             try: proc.kill()
             except Exception: pass
             self._tls.proc = self._spawn()
             return -1
 
     def verify_batch(self, jobs) -> List[int]:
-        futs = [self._exec.submit(self._verify_one, c, g) for (c, g) in jobs]
+        """jobs may be either:
+        - 2-tuples (cert_toks, goal_toks)         — legacy protocol, or
+        - 4-tuples (cert_toks, goal_toks, cn, gn) — H-prefixed protocol
+        with explicit NAME-pool entries."""
+        futs = []
+        for job in jobs:
+            if len(job) == 2:
+                futs.append(self._exec.submit(self._verify_one, job[0], job[1]))
+            else:
+                futs.append(self._exec.submit(
+                    self._verify_one, job[0], job[1], job[2], job[3]))
         return [f.result() for f in futs]
 
     def close(self):
