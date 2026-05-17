@@ -1,0 +1,4 @@
+(test
+ (name test_tokenizer)
+ (modules test_tokenizer)
+ (libraries kernel provers tokenizer))

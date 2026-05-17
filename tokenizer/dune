@@ -1,0 +1,5 @@
+(library
+ (name tokenizer)
+ (wrapped true)
+ (modules lexicon encode decode grammar synth)
+ (libraries kernel provers))

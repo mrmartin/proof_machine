@@ -1,0 +1,4 @@
+(executable
+ (name verify_tokens)
+ (modules verify_tokens)
+ (libraries kernel tokenizer))
