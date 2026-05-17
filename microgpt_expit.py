@@ -64,8 +64,8 @@ SFT_BATCH        = int(os.environ.get("HOL_EXPIT_SFT_BATCH",        "64"))
 SFT_STEPS        = int(os.environ.get("HOL_EXPIT_SFT_STEPS",        "200"))
 UPWEIGHT         = float(os.environ.get("HOL_EXPIT_UPWEIGHT",       "4.0"))
 LR               = float(os.environ.get("HOL_EXPIT_LR",             "3e-4"))
-BLOCK_SIZE       = int(os.environ.get("HOL_EXPIT_BLOCK_SIZE",       "96"))
-MAX_GEN          = int(os.environ.get("HOL_EXPIT_MAX_GEN",          "80"))
+BLOCK_SIZE       = int(os.environ.get("HOL_EXPIT_BLOCK_SIZE",       "192"))
+MAX_GEN          = int(os.environ.get("HOL_EXPIT_MAX_GEN",          "160"))
 VERIFIER_THREADS = int(os.environ.get("HOL_EXPIT_VERIFIER_THREADS",
                                        str(max(1, (os.cpu_count() or 4) - 4))))
 SEED             = int(os.environ.get("HOL_EXPIT_SEED", "42"))
@@ -165,20 +165,45 @@ def sample_rollouts(model: HOLGPT,
                     greedy: bool = False) -> List[List[int]]:
     """No-grad PDA-masked sampling.  Returns the list of generated token
     sequences (each rollout's emitted tokens, not including the prompt).
-    `greedy=True` overrides `temperature` and takes argmax."""
+    `greedy=True` overrides `temperature` and takes argmax.
+
+    Groups rollouts by prompt length and processes each group separately —
+    if we batched ragged prompts, PAD tokens would sit between each prompt
+    and its first sampled token, breaking position-embedding alignment vs
+    training (where the cert always starts immediately after the prompt)."""
+    if not prompts:
+        return []
+    by_len: dict = {}
+    for i, p in enumerate(prompts):
+        by_len.setdefault(len(p), []).append(i)
+    results: List[Optional[List[int]]] = [None] * len(prompts)
+    for L_, idxs in by_len.items():
+        sub_prompts = [prompts[i] for i in idxs]
+        sub_gens = _sample_uniform_length(model, sub_prompts, max_gen,
+                                          block_size, temperature, device, greedy)
+        for i, g in zip(idxs, sub_gens):
+            results[i] = g
+    return [g if g is not None else [] for g in results]
+
+
+def _sample_uniform_length(model: HOLGPT,
+                           prompts: List[List[int]],
+                           max_gen: int,
+                           block_size: int,
+                           temperature: float,
+                           device: torch.device,
+                           greedy: bool) -> List[List[int]]:
+    """Inner sampler: all prompts must have the same length, so no padding
+    is needed between prompt and sampled tokens."""
     B = len(prompts)
     if B == 0:
         return []
-
-    L = [len(p) for p in prompts]
-    L_max = max(L)
-    cur = torch.full((B, L_max), T.PAD, dtype=torch.long, device=device)
-    for b, p in enumerate(prompts):
-        cur[b, :L[b]] = torch.tensor(p, dtype=torch.long, device=device)
+    L = len(prompts[0])
+    cur = torch.tensor(prompts, dtype=torch.long, device=device)        # [B, L]
 
     grammar = [T.initial_state() for _ in range(B)]
     live = [True] * B
-    pos_next = list(L)
+    pos_next = [L] * B
     gen_toks_h: List[List[int]] = [[] for _ in range(B)]
 
     arange_B = torch.arange(B, device=device)
@@ -387,7 +412,7 @@ def main():
             log(f"round 0 bootstrap SFT done: loss={loss:.4f}  ({time.time()-t0:.1f}s)")
             ev = greedy_eval(model, vpool)
             solved = sum(1 for (_l, _gl, v) in ev if v == 100)
-            log(f"round 0 eval: solved={solved}/7  "
+            log(f"round 0 eval: solved={solved}/{len(encoded_goals)}  "
                 f"{' '.join(f'{l}=V{v:+d}' for l, _gl, v in ev)}")
             save_ckpt(CKPT_PATH, model, optim, 0)
             start_round = 0  # next round will be 1
@@ -464,7 +489,7 @@ def main():
             # 5) Greedy eval.
             ev = greedy_eval(model, vpool)
             solved = sum(1 for (_l, _gl, v) in ev if v == 100)
-            log(f"  eval: solved={solved}/7  "
+            log(f"  eval: solved={solved}/{len(encoded_goals)}  "
                 f"{' '.join(f'{l}=V{v:+d}' for l, _gl, v in ev)}")
             log(f"  round {round_idx} total: {time.time()-t_round:.1f}s")
 

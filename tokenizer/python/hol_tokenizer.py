@@ -840,9 +840,26 @@ def step(state, tok):
 
         if kind == 'NStepOrConclAfterLP':
             if tok == KW_STEP:
+                # Enforce strict step body: ( rule R ) ( witness W ) ( premises P* )
+                # The kernel decoder requires this exact order and exactly one
+                # of each — the loose NStepBody version below let the model
+                # emit double-witness / missing-premises certs that the PDA
+                # accepted but the kernel rejected.
                 s.extend([
-                    ('NCertBody',), ('Tok', RPAREN), ('NStepBody',),
-                    ('TInt',), ('Tok', KW_STEP),
+                    ('NCertBody',),                  # next cert element after step
+                    ('Tok', RPAREN),                 # close step
+                    ('NPremiseList',),               # premises body (self-closing)
+                    ('Tok', KW_PREMISES),
+                    ('Tok', LPAREN),                 # ( for premises clause
+                    ('NWitnessBody',),               # witness body (self-closing)
+                    ('Tok', KW_WITNESS),
+                    ('Tok', LPAREN),                 # ( for witness clause
+                    ('Tok', RPAREN),                 # close rule clause
+                    ('TRule',),
+                    ('Tok', KW_RULE),
+                    ('Tok', LPAREN),                 # ( for rule clause
+                    ('TInt',),                       # step ID
+                    ('Tok', KW_STEP),                # consume KW_step
                 ])
             elif tok == KW_CONCL:
                 s.extend([
@@ -853,27 +870,11 @@ def step(state, tok):
                 return None
             continue
 
-        if kind == 'NStepBody':
-            if tok == LPAREN:
-                s.extend([('NStepBody',), ('NStepFieldAfterLP',), ('Tok', LPAREN)])
-            elif tok == RPAREN:
-                # don't consume — yield to underlying Tok rparen
-                # i.e. drop NStepBody and re-dispatch the same token
-                pass
-            else:
-                return None
-            continue
-
-        if kind == 'NStepFieldAfterLP':
-            if tok == KW_RULE:
-                s.extend([('Tok', RPAREN), ('TRule',), ('Tok', KW_RULE)])
-            elif tok == KW_WITNESS:
-                s.extend([('NWitnessBody',), ('Tok', KW_WITNESS)])
-            elif tok == KW_PREMISES:
-                s.extend([('NPremiseList',), ('Tok', KW_PREMISES)])
-            else:
-                return None
-            continue
+        # NStepBody / NStepFieldAfterLP — dead code, replaced by the strict
+        # sequence above.  Left as no-ops to defend against any stale state
+        # in the unlikely event some external caller pushed them.
+        if kind == 'NStepBody' or kind == 'NStepFieldAfterLP':
+            return None
 
         if kind == 'NWitnessBody':
             if tok == RPAREN:

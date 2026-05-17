@@ -72,8 +72,8 @@ n_layer = 1
 n_embd = 12
 n_head = 4
 head_dim = n_embd // n_head
-block_size = int(os.environ.get("HOL_BLOCK_SIZE", "96"))
-max_gen_tokens = int(os.environ.get("HOL_MAX_GEN", "80"))
+block_size = int(os.environ.get("HOL_BLOCK_SIZE", "192"))
+max_gen_tokens = int(os.environ.get("HOL_MAX_GEN", "128"))
 vocab_size = T.VOCAB_SIZE
 BOS = T.BOS
 EOS = T.EOS
@@ -126,31 +126,107 @@ def G_refl(name):     v = T.mk_var(name, NAT);  return T.mk_eq(v, v)
 def G_refl_bool(name): v = T.mk_var(name, BOOL); return T.mk_eq(v, v)
 def G_imp_self(name):  p = T.mk_var(name, BOOL); return T.mk_imp(p, p)
 
+# Five new test seeds.  Domain-flavoured names (prime, gcd, ...) — these
+# get canonicalised to slot tokens at encode time, so the surface naming
+# doesn't change what the model sees but documents the intended use.
+def G_prime_imp(name_pred, name_n):
+    """(prime n) ==> (prime n) — uses a unary predicate of nat→bool."""
+    pred = T.mk_var(name_pred, T.fun_ty(NAT, BOOL))
+    n    = T.mk_var(name_n, NAT)
+    p_n  = T.mk_comb(pred, n)
+    return T.mk_imp(p_n, p_n)
+
+def G_conj_proj_left(name_p, name_q):
+    p = T.mk_var(name_p, BOOL); q = T.mk_var(name_q, BOOL)
+    return T.mk_imp(T.mk_conj(p, q), p)
+
+def G_conj_swap(name_p, name_q):
+    p = T.mk_var(name_p, BOOL); q = T.mk_var(name_q, BOOL)
+    return T.mk_imp(T.mk_conj(p, q), T.mk_conj(q, p))
+
+def G_k_combinator(name_p, name_q):
+    p = T.mk_var(name_p, BOOL); q = T.mk_var(name_q, BOOL)
+    return T.mk_imp(p, T.mk_imp(q, p))
+
+def G_gcd_refl(name_g, name_a, name_b):
+    """gcd a b = gcd a b — binary function on nat tests curried application."""
+    gty = T.fun_ty(NAT, T.fun_ty(NAT, NAT))
+    g = T.mk_var(name_g, gty)
+    a = T.mk_var(name_a, NAT); b = T.mk_var(name_b, NAT)
+    g_a_b = T.mk_comb(T.mk_comb(g, a), b)
+    return T.mk_eq(g_a_b, g_a_b)
+
 SEEDS = [
-    ("refl_x",      G_refl("x"),       1),
-    ("refl_y",      G_refl("y"),       1),
-    ("refl_n",      G_refl("n"),       1),
-    ("refl_p_bool", G_refl_bool("p"),  1),
-    ("refl_q_bool", G_refl_bool("q"),  1),
-    ("imp_p",       G_imp_self("p"),   2),
-    ("imp_q",       G_imp_self("q"),   2),
+    # Five original logical-tautology seeds.
+    ("refl_x",          G_refl("x"),                       1),
+    ("refl_y",          G_refl("y"),                       1),
+    ("refl_n",          G_refl("n"),                       1),
+    ("refl_p_bool",     G_refl_bool("p"),                  1),
+    ("refl_q_bool",     G_refl_bool("q"),                  1),
+    ("imp_p",           G_imp_self("p"),                   2),
+    ("imp_q",           G_imp_self("q"),                   2),
+    # Five new seeds with number-theory / algebra / crypto flavour.
+    ("prime_imp_prime", G_prime_imp("prime", "n"),         2),
+    ("conj_proj_left",  G_conj_proj_left("a", "b"),        3),
+    ("conj_swap",       G_conj_swap("a", "b"),             5),
+    ("k_combinator",    G_k_combinator("p", "q"),          3),
+    ("gcd_refl",        G_gcd_refl("gcd", "a", "b"),       1),
 ]
 
 def gold_cert_for(label, goal):
     """Hand-built kernel-valid cert that proves `goal`.  Used for the
     supervised warmup (tweak #3)."""
-    if label.startswith("refl_"):
-        x = goal[2]  # goal = mk_eq(x, x) = ("Comb", ("Comb", "=", x), x)
+    if label.startswith("refl_") or label == "gcd_refl":
+        # goal = mk_eq(x, x) = ("Comb", ("Comb", "=", x), x)
+        x = goal[2]
         return T.Cert(
             steps=[T.Step(1, "REFL", ("term", x), [])],
             concl=goal,
         )
-    if label.startswith("imp_"):
-        p = goal[2]  # goal = mk_imp(p, p) = ("Comb", ("Comb", "==>", p), p)
+    if label.startswith("imp_") or label == "prime_imp_prime":
+        # goal = mk_imp(p, p) where p may itself be compound (e.g. a predicate
+        # application).  Extract p from the consequent slot of the outer Comb.
+        p = goal[2]
         return T.Cert(
             steps=[
                 T.Step(1, "ASSUME", ("term", p), []),
                 T.Step(2, "DISCH",  ("term", p), [1]),
+            ],
+            concl=goal,
+        )
+    if label == "conj_proj_left":
+        # goal = mk_imp(p /\ q, p)
+        pq = goal[1][2]          # the antecedent (p /\ q)
+        return T.Cert(
+            steps=[
+                T.Step(1, "ASSUME",    ("term", pq), []),
+                T.Step(2, "CONJUNCT1", ("none",),    [1]),
+                T.Step(3, "DISCH",     ("term", pq), [2]),
+            ],
+            concl=goal,
+        )
+    if label == "conj_swap":
+        # goal = mk_imp(p /\ q, q /\ p)
+        pq = goal[1][2]
+        return T.Cert(
+            steps=[
+                T.Step(1, "ASSUME",    ("term", pq), []),
+                T.Step(2, "CONJUNCT1", ("none",),    [1]),
+                T.Step(3, "CONJUNCT2", ("none",),    [1]),
+                T.Step(4, "CONJ",      ("none",),    [3, 2]),
+                T.Step(5, "DISCH",     ("term", pq), [4]),
+            ],
+            concl=goal,
+        )
+    if label == "k_combinator":
+        # goal = mk_imp(p, mk_imp(q, p))
+        p = goal[1][2]            # p
+        q = goal[2][1][2]         # q (from the inner mk_imp)
+        return T.Cert(
+            steps=[
+                T.Step(1, "ASSUME", ("term", p), []),
+                T.Step(2, "DISCH",  ("term", q), [1]),
+                T.Step(3, "DISCH",  ("term", p), [2]),
             ],
             concl=goal,
         )
@@ -197,33 +273,326 @@ def _build_supervised_corpus():
                     T.Step(2, "GEN",  ("var", name, ty), [1]),
                 ], concl=T.mk_forall(name, ty, eq)))
 
-    def beta_pair(bound_name, witness_name):
+    def beta_pair(bound_name, _ignored=None):
+        # Kernel BETA fires on (λv. body) v where the argument equals the
+        # bound variable.  Force witness == bound; legacy callers passed a
+        # second name but those certs were kernel-invalid.
         ty = nat
-        body = T.mk_var(bound_name, ty)
-        lam  = T.mk_abs(bound_name, ty, body)
-        wit  = T.mk_var(witness_name, ty)
-        app  = T.mk_comb(lam, wit)
-        return (T.mk_eq(app, wit),
+        v = T.mk_var(bound_name, ty)
+        lam  = T.mk_abs(bound_name, ty, v)
+        app  = T.mk_comb(lam, v)
+        return (T.mk_eq(app, v),
                 T.Cert(steps=[T.Step(1, "BETA", ("term", app), [])],
-                       concl=T.mk_eq(app, wit)))
+                       concl=T.mk_eq(app, v)))
+
+    # --- New patterns (20 total) ------------------------------------------
+    #
+    # Logical schemata with domain-flavoured naming.  The tokenizer
+    # canonicalises variable names to pool slots, so the proof STRUCTURE is
+    # what the model learns; the surface vocabulary is for readability.
+    # Each function returns a (goal, gold_cert) pair.
+
+    def k_pair(name_p, name_q):
+        """p ==> (q ==> p) — K combinator.  3 steps."""
+        p = T.mk_var(name_p, bool_); q = T.mk_var(name_q, bool_)
+        goal = T.mk_imp(p, T.mk_imp(q, p))
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", p), []),
+            T.Step(2, "DISCH",  ("term", q), [1]),
+            T.Step(3, "DISCH",  ("term", p), [2]),
+        ], concl=goal))
+
+    def conj_elim1_pair(name_p, name_q):
+        """(p /\\ q) ==> p — conjunction elimination (left).  3 steps."""
+        p = T.mk_var(name_p, bool_); q = T.mk_var(name_q, bool_)
+        pq = T.mk_conj(p, q); goal = T.mk_imp(pq, p)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME",    ("term", pq), []),
+            T.Step(2, "CONJUNCT1", ("none",),    [1]),
+            T.Step(3, "DISCH",     ("term", pq), [2]),
+        ], concl=goal))
+
+    def conj_elim2_pair(name_p, name_q):
+        """(p /\\ q) ==> q — conjunction elimination (right).  3 steps."""
+        p = T.mk_var(name_p, bool_); q = T.mk_var(name_q, bool_)
+        pq = T.mk_conj(p, q); goal = T.mk_imp(pq, q)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME",    ("term", pq), []),
+            T.Step(2, "CONJUNCT2", ("none",),    [1]),
+            T.Step(3, "DISCH",     ("term", pq), [2]),
+        ], concl=goal))
+
+    def conj_commute_pair(name_p, name_q):
+        """(p /\\ q) ==> (q /\\ p) — conjunction commutes.  5 steps."""
+        p = T.mk_var(name_p, bool_); q = T.mk_var(name_q, bool_)
+        pq = T.mk_conj(p, q); qp = T.mk_conj(q, p); goal = T.mk_imp(pq, qp)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME",    ("term", pq), []),
+            T.Step(2, "CONJUNCT1", ("none",),    [1]),
+            T.Step(3, "CONJUNCT2", ("none",),    [1]),
+            T.Step(4, "CONJ",      ("none",),    [3, 2]),
+            T.Step(5, "DISCH",     ("term", pq), [4]),
+        ], concl=goal))
+
+    def curried_conj_pair(name_p, name_q):
+        """p ==> q ==> (p /\\ q) — curried conjunction introduction.  5 steps."""
+        p = T.mk_var(name_p, bool_); q = T.mk_var(name_q, bool_)
+        pq = T.mk_conj(p, q); goal = T.mk_imp(p, T.mk_imp(q, pq))
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", p), []),
+            T.Step(2, "ASSUME", ("term", q), []),
+            T.Step(3, "CONJ",   ("none",),   [1, 2]),
+            T.Step(4, "DISCH",  ("term", q), [3]),
+            T.Step(5, "DISCH",  ("term", p), [4]),
+        ], concl=goal))
+
+    def self_conj_pair(name_p):
+        """p ==> (p /\\ p) — same-prop conjunction.  3 steps."""
+        p = T.mk_var(name_p, bool_)
+        pp = T.mk_conj(p, p); goal = T.mk_imp(p, pp)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", p), []),
+            T.Step(2, "CONJ",   ("none",),   [1, 1]),
+            T.Step(3, "DISCH",  ("term", p), [2]),
+        ], concl=goal))
+
+    def imp_self_conj_pair(name_p, name_q):
+        """(p /\\ q) ==> (p /\\ q) — imp_self with compound antecedent.  2 steps."""
+        p = T.mk_var(name_p, bool_); q = T.mk_var(name_q, bool_)
+        pq = T.mk_conj(p, q); goal = T.mk_imp(pq, pq)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", pq), []),
+            T.Step(2, "DISCH",  ("term", pq), [1]),
+        ], concl=goal))
+
+    def forall_double_pair(name_x, name_y, ty):
+        """∀x. ∀y. x = x — nested quantifiers.  3 steps."""
+        x = T.mk_var(name_x, ty); eq = T.mk_eq(x, x)
+        inner = T.mk_forall(name_y, ty, eq)
+        outer = T.mk_forall(name_x, ty, inner)
+        return (outer, T.Cert(steps=[
+            T.Step(1, "REFL", ("term", x),            []),
+            T.Step(2, "GEN",  ("var", name_y, ty),    [1]),
+            T.Step(3, "GEN",  ("var", name_x, ty),    [2]),
+        ], concl=outer))
+
+    def spec_instance_pair(name_v, name_n, ty):
+        """(∀v. v = v) ==> n = n — universal instantiation.  3 steps."""
+        v = T.mk_var(name_v, ty); eq_v = T.mk_eq(v, v)
+        forall_eq = T.mk_forall(name_v, ty, eq_v)
+        n = T.mk_var(name_n, ty); eq_n = T.mk_eq(n, n)
+        goal = T.mk_imp(forall_eq, eq_n)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", forall_eq), []),
+            T.Step(2, "SPEC",   ("term", n),         [1]),
+            T.Step(3, "DISCH",  ("term", forall_eq), [2]),
+        ], concl=goal))
+
+    def trans_refl_pair(name_a, ty):
+        """a = a via TRANS of two REFLs — structural variety.  3 steps."""
+        a = T.mk_var(name_a, ty); goal = T.mk_eq(a, a)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "REFL",  ("term", a), []),
+            T.Step(2, "REFL",  ("term", a), []),
+            T.Step(3, "TRANS", ("none",),   [1, 2]),
+        ], concl=goal))
+
+    def mk_comb_refl_pair(name_f, name_a):
+        """f a = f a via MK_COMB(REFL f, REFL a) — function-typed variable.  3 steps."""
+        fty = T.fun_ty(nat, nat)
+        f = T.mk_var(name_f, fty); a = T.mk_var(name_a, nat)
+        fa = T.mk_comb(f, a); goal = T.mk_eq(fa, fa)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "REFL",    ("term", f), []),
+            T.Step(2, "REFL",    ("term", a), []),
+            T.Step(3, "MK_COMB", ("none",),   [1, 2]),
+        ], concl=goal))
+
+    def abs_refl_pair(name_x, _ignored=None):
+        """(λx. x) = (λx. x) — identity-lambda equality via REFL+ABS.  2 steps.
+        Binder and body variable must share a name to avoid a pool-slot
+        ordering mismatch between cert (REFL-first) and goal (binder-first)
+        encodings — they'd otherwise canonicalise the same logical variable
+        to different free slots and fail kernel α-eq."""
+        v = T.mk_var(name_x, nat)
+        lam = T.mk_abs(name_x, nat, v); goal = T.mk_eq(lam, lam)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "REFL", ("term", v),            []),
+            T.Step(2, "ABS",  ("var", name_x, nat),   [1]),
+        ], concl=goal))
+
+    def gen_then_imp_pair(name_p, name_x):
+        """p ==> ∀x:nat. p — vacuous universal under hypothesis.  3 steps."""
+        p = T.mk_var(name_p, bool_)
+        forall_p = T.mk_forall(name_x, nat, p)
+        goal = T.mk_imp(p, forall_p)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", p),         []),
+            T.Step(2, "GEN",    ("var", name_x, nat), [1]),
+            T.Step(3, "DISCH",  ("term", p),         [2]),
+        ], concl=goal))
+
+    def exists_intro_pair(name_y, name_w, ty):
+        """∃y. y = y via EXISTS-intro of REFL(w).  2 steps.
+        Requires name_y ≠ name_w (EXISTS needs the bound name to not clash
+        with a free variable in the conclusion of the premise theorem)."""
+        w = T.mk_var(name_w, ty)
+        body = T.mk_eq(T.mk_var(name_y, ty), T.mk_var(name_y, ty))
+        goal = T.mk_exists(name_y, ty, body)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "REFL",   ("term", w),                       []),
+            T.Step(2, "EXISTS", ("bnw", name_y, ty, w),            [1]),
+        ], concl=goal))
+
+    def mp_curried_pair(name_p, name_q):
+        """(p ==> q) ==> p ==> q — uses MP.  5 steps."""
+        p = T.mk_var(name_p, bool_); q = T.mk_var(name_q, bool_)
+        pimpq = T.mk_imp(p, q)
+        goal = T.mk_imp(pimpq, T.mk_imp(p, q))
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", pimpq), []),
+            T.Step(2, "ASSUME", ("term", p),     []),
+            T.Step(3, "MP",     ("none",),       [1, 2]),
+            T.Step(4, "DISCH",  ("term", p),     [3]),
+            T.Step(5, "DISCH",  ("term", pimpq), [4]),
+        ], concl=goal))
+
+    def deduct_antisym_pair(name_p):
+        """p = p via DEDUCT_ANTISYM of ASSUME(p), ASSUME(p).  3 steps."""
+        p = T.mk_var(name_p, bool_); goal = T.mk_eq(p, p)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME",              ("term", p), []),
+            T.Step(2, "ASSUME",              ("term", p), []),
+            T.Step(3, "DEDUCT_ANTISYM_RULE", ("none",),   [1, 2]),
+        ], concl=goal))
+
+    def refl_fun_pair(name_f, dom_ty, cod_ty):
+        """f = f for f of function type — wider type variety.  1 step."""
+        f = T.mk_var(name_f, T.fun_ty(dom_ty, cod_ty))
+        goal = T.mk_eq(f, f)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "REFL", ("term", f), []),
+        ], concl=goal))
+
+    def refl_app_pair(name_pred, name_n):
+        """(pred n) = (pred n) for pred:nat→bool — predicate-application REFL.  1 step."""
+        pred = T.mk_var(name_pred, T.fun_ty(nat, bool_))
+        n = T.mk_var(name_n, nat)
+        p_n = T.mk_comb(pred, n)
+        goal = T.mk_eq(p_n, p_n)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "REFL", ("term", p_n), []),
+        ], concl=goal))
+
+    def imp_self_app_pair(name_pred, name_n):
+        """(p n) ==> (p n) — imp_self over a predicate application.  2 steps.
+        Bridges the imp_self structure to predicate-application prompts."""
+        pred = T.mk_var(name_pred, T.fun_ty(nat, bool_))
+        n = T.mk_var(name_n, nat)
+        p_n = T.mk_comb(pred, n)
+        goal = T.mk_imp(p_n, p_n)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", p_n), []),
+            T.Step(2, "DISCH",  ("term", p_n), [1]),
+        ], concl=goal))
+
+    def refl_curried_pair(name_f, name_a, name_b):
+        """(f a b) = (f a b) for f:nat→nat→nat — curried 2-arg application REFL.
+        1 step.  Bridges to gcd-style binary-operator prompts."""
+        fty = T.fun_ty(nat, T.fun_ty(nat, nat))
+        f = T.mk_var(name_f, fty)
+        a = T.mk_var(name_a, nat); b = T.mk_var(name_b, nat)
+        fab = T.mk_comb(T.mk_comb(f, a), b)
+        goal = T.mk_eq(fab, fab)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "REFL", ("term", fab), []),
+        ], concl=goal))
+
+    def imp_eq_pair(name_m, name_n, ty):
+        """(m = n) ==> (m = n) — imp_self with equation antecedent.  2 steps."""
+        m = T.mk_var(name_m, ty); n = T.mk_var(name_n, ty)
+        eq = T.mk_eq(m, n); goal = T.mk_imp(eq, eq)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", eq), []),
+            T.Step(2, "DISCH",  ("term", eq), [1]),
+        ], concl=goal))
 
     NAMES = ["a", "b", "c", "p", "q", "x", "y", "z", "n", "m", "k", "u", "v", "w"]
     per_pattern = int(os.environ.get("HOL_CORPUS_PER_PATTERN", "200"))
 
-    # 6 distinct token patterns × per_pattern replicas each.
+    def _pick(i):  return NAMES[i % len(NAMES)]
+    def _pick2(i): return NAMES[(i + 1) % len(NAMES)]
+
+    # --- Original 6 patterns ---------------------------------------------
     for ty in (nat, bool_, ind):
         for _ in range(per_pattern):
-            out.append(refl_pair(NAMES[len(out) % len(NAMES)], ty))
+            out.append(refl_pair(_pick(len(out)), ty))
 
     for _ in range(per_pattern * 2):
-        out.append(imp_pair(NAMES[len(out) % len(NAMES)]))
+        out.append(imp_pair(_pick(len(out))))
 
     for ty in (nat, bool_):
         for _ in range(per_pattern):
-            out.append(forall_refl_pair(NAMES[len(out) % len(NAMES)], ty))
+            out.append(forall_refl_pair(_pick(len(out)), ty))
 
     for _ in range(per_pattern):
-        out.append(beta_pair("x", NAMES[len(out) % len(NAMES)]))
+        out.append(beta_pair("x", _pick(len(out))))
+
+    # --- New patterns (per_pattern_new replicas each) --------------------
+    # Use full per_pattern replication so each new pattern gets equal
+    # sampling weight to the original ones; the rarer 5-step proof shapes
+    # otherwise get half the SGD updates and fall behind under greedy eval.
+    per_pattern_new = per_pattern
+
+    for _ in range(per_pattern_new):
+        out.append(k_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(conj_elim1_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(conj_elim2_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(conj_commute_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(curried_conj_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(self_conj_pair(_pick(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(imp_self_conj_pair(_pick(len(out)), _pick2(len(out))))
+    for ty in (nat, bool_):
+        for _ in range(per_pattern_new):
+            out.append(forall_double_pair(_pick(len(out)), _pick2(len(out)), ty))
+    for ty in (nat, bool_):
+        for _ in range(per_pattern_new):
+            out.append(spec_instance_pair(_pick(len(out)), _pick2(len(out)), ty))
+    for ty in (nat, bool_, ind):
+        for _ in range(per_pattern_new):
+            out.append(trans_refl_pair(_pick(len(out)), ty))
+    for _ in range(per_pattern_new):
+        out.append(mk_comb_refl_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(abs_refl_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(gen_then_imp_pair(_pick(len(out)), _pick2(len(out))))
+    for ty in (nat, bool_):
+        for _ in range(per_pattern_new):
+            out.append(exists_intro_pair(_pick(len(out)), _pick2(len(out)), ty))
+    for _ in range(per_pattern_new):
+        out.append(mp_curried_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(deduct_antisym_pair(_pick(len(out))))
+    for dom, cod in ((nat, nat), (nat, bool_), (bool_, bool_)):
+        for _ in range(per_pattern_new):
+            out.append(refl_fun_pair(_pick(len(out)), dom, cod))
+    for _ in range(per_pattern_new):
+        out.append(refl_app_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(imp_self_app_pair(_pick(len(out)), _pick2(len(out))))
+    for _ in range(per_pattern_new):
+        out.append(refl_curried_pair(_pick(len(out)), _pick2(len(out)),
+                                      NAMES[(len(out) + 2) % len(NAMES)]))
+    for ty in (nat, bool_):
+        for _ in range(per_pattern_new):
+            out.append(imp_eq_pair(_pick(len(out)), _pick2(len(out)), ty))
 
     random.Random(42).shuffle(out)
     return out
