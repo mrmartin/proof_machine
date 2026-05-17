@@ -29,7 +29,7 @@ import json
 import time
 import random
 from dataclasses import dataclass, field, asdict
-from typing import List, Tuple, Optional, Set
+from typing import List, Tuple, Optional, Set, Sequence
 
 import torch
 import torch.nn as nn
@@ -47,7 +47,7 @@ from microgpt_with_RL_hol_gpu import (  # noqa: E402
 )
 # Reuse seed + corpus data from the CPU trainer.
 from microgpt_with_RL_hol import (  # noqa: E402
-    SEEDS, encoded_goals, ENCODED_CORPUS,
+    SEEDS, encoded_goals, ENCODED_CORPUS, CORPUS,
 )
 
 
@@ -56,6 +56,7 @@ from microgpt_with_RL_hol import (  # noqa: E402
 # ---------------------------------------------------------------------------
 LOG_PATH         = os.environ.get("HOL_EXPIT_LOG_PATH",    os.path.join(HERE, "hol_expit.log"))
 BUFFER_PATH      = os.environ.get("HOL_EXPIT_BUFFER_PATH", os.path.join(HERE, "hol_expit_buffer.jsonl"))
+NOVEL_PATH       = os.environ.get("HOL_EXPIT_NOVEL_PATH",  os.path.join(HERE, "hol_expit_novel.jsonl"))
 CKPT_PATH        = os.environ.get("HOL_EXPIT_CKPT_PATH",   os.path.join(HERE, "hol_expit_ckpt.pt"))
 NUM_ROUNDS       = int(os.environ.get("HOL_EXPIT_NUM_ROUNDS",       "10"))
 SAMPLES_PER_GOAL = int(os.environ.get("HOL_EXPIT_SAMPLES_PER_GOAL", "32"))
@@ -151,6 +152,54 @@ def init_buffer_from_corpus() -> Tuple[List[BufferEntry], Set[Tuple[tuple, tuple
         entries.append(e)
         keys.add(_key(e))
     return entries, keys
+
+
+# ---------------------------------------------------------------------------
+# Novelty detection: a discovered cert is "novel" iff its rule-sequence
+# shape never appears in any supervised-corpus cert.  This is the metric
+# the experiment cares about — does ExitIt invent new rule combinations,
+# or only amplify what was planted in training?
+# ---------------------------------------------------------------------------
+_RULE_NAME_BY_TOK = {tok: name for name, tok in T.RULE_TOK.items()}
+
+
+def cert_rule_shape(cert_toks: Sequence[int]) -> Tuple[str, ...]:
+    """Extract the ordered tuple of rule names used in a cert by scanning
+    for `KW_rule <RULE>` patterns.  Independent of pool slots — only the
+    rule sequence matters."""
+    rules: List[str] = []
+    n = len(cert_toks)
+    for i in range(n - 1):
+        if cert_toks[i] == T.KW_RULE:
+            # Next rule-class token (skip parens/whitespace if any).
+            for j in range(i + 1, min(i + 4, n)):
+                t = cert_toks[j]
+                if T.RULE_FIRST <= t <= T.RULE_LAST:
+                    rules.append(_RULE_NAME_BY_TOK[t])
+                    break
+    return tuple(rules)
+
+
+def _build_corpus_rule_shapes() -> set:
+    """Pre-compute the set of rule-sequence shapes in the supervised
+    corpus.  Anything not in here is a NEW rule sequence the model
+    invented during exploration."""
+    shapes: set = set()
+    for goal, cert in CORPUS:
+        cert_toks, _ = T.encode_cert(cert)
+        shapes.add(cert_rule_shape(cert_toks))
+    return shapes
+
+
+CORPUS_RULE_SHAPES = _build_corpus_rule_shapes()
+
+
+def append_novel_jsonl(path: str, entries):
+    if not entries:
+        return
+    with open(path, "a") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +419,12 @@ def main():
     log(f"vocab={T.VOCAB_SIZE}  block={BLOCK_SIZE}  max_gen={MAX_GEN}")
     log(f"#seeds: {len(encoded_goals)}")
     for label, _g, gt, ct in encoded_goals:
-        log(f"  {label}: prompt-toks={len(gt)} gold-cert-toks={len(ct)}")
+        seed_shape = cert_rule_shape(ct)
+        seed_novel = "" if seed_shape in CORPUS_RULE_SHAPES else "  [OOD shape]"
+        log(f"  {label}: prompt-toks={len(gt)} gold-cert-toks={len(ct)}{seed_novel}")
+    log(f"corpus rule-sequence baseline: {len(CORPUS_RULE_SHAPES)} unique shapes")
+    for s in sorted(CORPUS_RULE_SHAPES):
+        log(f"  baseline: {'-'.join(s) if s else '(empty)'}")
 
     torch.manual_seed(SEED)
     random.seed(SEED)
@@ -448,6 +502,8 @@ def main():
             # 3) Dedup + append.
             per_seed_success = [0] * len(encoded_goals)
             new_entries: List[BufferEntry] = []
+            novel_records = []           # for the novel JSONL
+            novel_shapes_this_round = {} # shape -> sample (label, gen_len) for log
             for i, v in enumerate(verdicts):
                 if v != 100:
                     continue
@@ -458,6 +514,21 @@ def main():
                     source="discovered",
                     discovered_round=round_idx,
                 )
+                # Novelty check: does this cert use a rule-sequence shape
+                # absent from the supervised corpus?  If so, record it
+                # — this is the metric for "did the model invent something".
+                shape = cert_rule_shape(e.cert_toks)
+                if shape and shape not in CORPUS_RULE_SHAPES:
+                    seed_label = encoded_goals[goal_for[i]][0]
+                    if shape not in novel_shapes_this_round:
+                        novel_shapes_this_round[shape] = (seed_label, len(e.cert_toks))
+                    novel_records.append({
+                        "round": round_idx,
+                        "seed_label": seed_label,
+                        "shape": list(shape),
+                        "goal_toks": e.goal_toks,
+                        "cert_toks": e.cert_toks,
+                    })
                 k = _key(e)
                 if k in buffer_keys:
                     continue
@@ -466,10 +537,16 @@ def main():
                 new_entries.append(e)
             if new_entries:
                 append_buffer_jsonl(BUFFER_PATH, new_entries)
+            if novel_records:
+                append_novel_jsonl(NOVEL_PATH, novel_records)
             log(f"  exploration: {len(prompts)} proposals, "
                 f"{sum(per_seed_success)} verified (+100), "
                 f"{len(new_entries)} new unique → buffer={len(buffer)} "
                 f"({t_sample:.1f}s sample / {t_verify:.1f}s verify)")
+            if novel_shapes_this_round:
+                log(f"  *** NOVEL rule sequences this round: {len(novel_shapes_this_round)} unique, {len(novel_records)} total ***")
+                for shape, (lbl, n_toks) in novel_shapes_this_round.items():
+                    log(f"      [{lbl}] {' -> '.join(shape)}  (cert={n_toks} toks)")
             for s_i, (lbl, _g, _gt, _ct) in enumerate(encoded_goals):
                 if per_seed_success[s_i] > 0:
                     log(f"    {lbl}: {per_seed_success[s_i]}/{SAMPLES_PER_GOAL} succeeded")
@@ -495,6 +572,23 @@ def main():
 
             save_ckpt(CKPT_PATH, model, optim, round_idx)
 
+        # End-of-run novelty summary: scan the novel JSONL we wrote and
+        # report which (if any) rule sequences the model invented that
+        # the supervised corpus never showed.
+        novel_shape_counts = {}
+        novel_total = 0
+        if os.path.exists(NOVEL_PATH):
+            with open(NOVEL_PATH) as f:
+                for line in f:
+                    rec = json.loads(line)
+                    novel_total += 1
+                    shp = tuple(rec["shape"])
+                    novel_shape_counts[shp] = novel_shape_counts.get(shp, 0) + 1
+        log("=== Novelty summary ===")
+        log(f"  corpus baseline shapes: {len(CORPUS_RULE_SHAPES)}")
+        log(f"  novel certs discovered: {novel_total} across {len(novel_shape_counts)} unique shapes")
+        for shp, cnt in sorted(novel_shape_counts.items(), key=lambda x: -x[1]):
+            log(f"    {cnt:4d}× {' -> '.join(shp) if shp else '(empty)'}")
         log("=== run complete ===")
     finally:
         vpool.close()
