@@ -749,6 +749,22 @@ def _build_supervised_corpus():
             T.Step(2, "DISCH",  ("term", eq), [1]),
         ], concl=goal))
 
+    def beta_inst_pair(name_x, name_y, ty):
+        """(λx. x) y = y for fresh y, proved by BETA + INST.  2 steps.
+        Adds first-class exposure to the INST rule, which the model had
+        previously seen in zero corpus patterns.  Requires name_x ≠ name_y
+        (otherwise the cert and goal collapse to a pure BETA proof)."""
+        x = T.mk_var(name_x, ty)
+        lam = T.mk_abs(name_x, ty, x)
+        y = T.mk_var(name_y, ty)
+        # (λx. x) x — argument equals bound var, so kernel BETA fires.
+        bound_app = T.mk_comb(lam, x)
+        goal = T.mk_eq(T.mk_comb(lam, y), y)
+        return (goal, T.Cert(steps=[
+            T.Step(1, "BETA", ("term", bound_app), []),
+            T.Step(2, "INST", ("inst", [(x, y)]), [1]),
+        ], concl=goal))
+
     NAMES = ["a", "b", "c", "p", "q", "x", "y", "z", "n", "m", "k", "u", "v", "w"]
     per_pattern = int(os.environ.get("HOL_CORPUS_PER_PATTERN", "200"))
 
@@ -825,6 +841,9 @@ def _build_supervised_corpus():
     for ty in (nat, bool_):
         for _ in range(per_pattern_new):
             out.append(imp_eq_pair(_pick(len(out)), _pick2(len(out)), ty))
+    for ty in (nat, bool_):
+        for _ in range(per_pattern_new):
+            out.append(beta_inst_pair(_pick(len(out)), _pick2(len(out)), ty))
 
     random.Random(42).shuffle(out)
     return out
