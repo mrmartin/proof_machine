@@ -72,8 +72,8 @@ n_layer = 1
 n_embd = 12
 n_head = 4
 head_dim = n_embd // n_head
-block_size = int(os.environ.get("HOL_BLOCK_SIZE", "192"))
-max_gen_tokens = int(os.environ.get("HOL_MAX_GEN", "128"))
+block_size = int(os.environ.get("HOL_BLOCK_SIZE", "320"))
+max_gen_tokens = int(os.environ.get("HOL_MAX_GEN", "256"))
 vocab_size = T.VOCAB_SIZE
 BOS = T.BOS
 EOS = T.EOS
@@ -156,6 +156,74 @@ def G_gcd_refl(name_g, name_a, name_b):
     g_a_b = T.mk_comb(T.mk_comb(g, a), b)
     return T.mk_eq(g_a_b, g_a_b)
 
+# ---------------------------------------------------------------------------
+# Ten HARDER out-of-distribution test seeds.  These are NOT included in the
+# supervised corpus — they test whether the model can prove theorems whose
+# proof structures it has never seen, rather than memorising training data.
+# ---------------------------------------------------------------------------
+def G_comp_imp(name_p, name_q, name_r):
+    """(p ==> q) ==> (q ==> r) ==> (p ==> r) — hypothetical syllogism. 8 steps."""
+    p = T.mk_var(name_p, BOOL); q = T.mk_var(name_q, BOOL); r = T.mk_var(name_r, BOOL)
+    return T.mk_imp(T.mk_imp(p, q), T.mk_imp(T.mk_imp(q, r), T.mk_imp(p, r)))
+
+def G_conj_assoc(name_p, name_q, name_r):
+    """((p /\\ q) /\\ r) ==> (p /\\ (q /\\ r)) — conjunction reassociation. 8 steps."""
+    p = T.mk_var(name_p, BOOL); q = T.mk_var(name_q, BOOL); r = T.mk_var(name_r, BOOL)
+    return T.mk_imp(T.mk_conj(T.mk_conj(p, q), r), T.mk_conj(p, T.mk_conj(q, r)))
+
+def G_triple_conj_intro(name_p, name_q, name_r):
+    """p ==> q ==> r ==> (p /\\ q /\\ r) — 3-way conjunction introduction. 8 steps."""
+    p = T.mk_var(name_p, BOOL); q = T.mk_var(name_q, BOOL); r = T.mk_var(name_r, BOOL)
+    return T.mk_imp(p, T.mk_imp(q, T.mk_imp(r, T.mk_conj(p, T.mk_conj(q, r)))))
+
+def G_eq_trans_impl(name_a, name_b, name_c):
+    """(a = b) ==> (b = c) ==> (a = c) — equality transitivity in impl form. 5 steps."""
+    a = T.mk_var(name_a, NAT); b = T.mk_var(name_b, NAT); c = T.mk_var(name_c, NAT)
+    return T.mk_imp(T.mk_eq(a, b), T.mk_imp(T.mk_eq(b, c), T.mk_eq(a, c)))
+
+def G_mk_comb_impl(name_f, name_g, name_a, name_b):
+    """(f = g) ==> (a = b) ==> (f a = g b) — congruence of application. 5 steps."""
+    fty = T.fun_ty(NAT, NAT)
+    f = T.mk_var(name_f, fty); g = T.mk_var(name_g, fty)
+    a = T.mk_var(name_a, NAT); b = T.mk_var(name_b, NAT)
+    return T.mk_imp(T.mk_eq(f, g),
+                    T.mk_imp(T.mk_eq(a, b),
+                             T.mk_eq(T.mk_comb(f, a), T.mk_comb(g, b))))
+
+def G_abs_impl(name_a, name_b, name_x):
+    """(a = b) ==> ((λx. a) = (λx. b)) — lambda extensionality lift. 3 steps."""
+    a = T.mk_var(name_a, NAT); b = T.mk_var(name_b, NAT)
+    lam_a = T.mk_abs(name_x, NAT, a)
+    lam_b = T.mk_abs(name_x, NAT, b)
+    return T.mk_imp(T.mk_eq(a, b), T.mk_eq(lam_a, lam_b))
+
+def G_disj_imp_self(name_p, name_q):
+    """(p \\/ q) ==> (p \\/ q) — imp_self over disjunction. 2 steps."""
+    p = T.mk_var(name_p, BOOL); q = T.mk_var(name_q, BOOL)
+    pq = T.mk_disj(p, q)
+    return T.mk_imp(pq, pq)
+
+def G_spec_twice(name_x, name_y, name_n):
+    """(∀x. ∀y. x = x) ==> (n = n) — double specialisation. 4 steps."""
+    x = T.mk_var(name_x, NAT)
+    eq_x = T.mk_eq(x, x)
+    inner = T.mk_forall(name_y, NAT, eq_x)
+    outer = T.mk_forall(name_x, NAT, inner)
+    n = T.mk_var(name_n, NAT)
+    return T.mk_imp(outer, T.mk_eq(n, n))
+
+def G_conj_of_eqs(name_a, name_b):
+    """(a = a) /\\ (b = b) — pure conjunction of reflexivities, no hypotheses. 3 steps."""
+    a = T.mk_var(name_a, NAT); b = T.mk_var(name_b, NAT)
+    return T.mk_conj(T.mk_eq(a, a), T.mk_eq(b, b))
+
+def G_double_gen_imp(name_p, name_x, name_y):
+    """p ==> ∀x:nat. ∀y:bool. p — double vacuous generalisation. 4 steps."""
+    p = T.mk_var(name_p, BOOL)
+    forall_inner = T.mk_forall(name_y, BOOL, p)
+    forall_outer = T.mk_forall(name_x, NAT, forall_inner)
+    return T.mk_imp(p, forall_outer)
+
 SEEDS = [
     # Five original logical-tautology seeds.
     ("refl_x",          G_refl("x"),                       1),
@@ -171,6 +239,17 @@ SEEDS = [
     ("conj_swap",       G_conj_swap("a", "b"),             5),
     ("k_combinator",    G_k_combinator("p", "q"),          3),
     ("gcd_refl",        G_gcd_refl("gcd", "a", "b"),       1),
+    # Ten harder OOD seeds.  NOT in the supervised corpus.
+    ("disj_imp_self",   G_disj_imp_self("p", "q"),            2),
+    ("conj_of_eqs",     G_conj_of_eqs("a", "b"),              3),
+    ("abs_impl",        G_abs_impl("a", "b", "x"),            3),
+    ("spec_twice",      G_spec_twice("x", "y", "n"),          4),
+    ("double_gen_imp",  G_double_gen_imp("p", "x", "y"),      4),
+    ("eq_trans_impl",   G_eq_trans_impl("a", "b", "c"),       5),
+    ("mk_comb_impl",    G_mk_comb_impl("f", "g", "a", "b"),   5),
+    ("comp_imp",        G_comp_imp("p", "q", "r"),            8),
+    ("conj_assoc",      G_conj_assoc("p", "q", "r"),          8),
+    ("triple_conj_intro", G_triple_conj_intro("p", "q", "r"), 8),
 ]
 
 def gold_cert_for(label, goal):
@@ -230,6 +309,126 @@ def gold_cert_for(label, goal):
             ],
             concl=goal,
         )
+    # ---------- 10 harder OOD seeds (not in corpus) -------------------
+    if label == "disj_imp_self":
+        pq = goal[2]   # mk_imp(p \/ q, p \/ q)
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", pq), []),
+            T.Step(2, "DISCH",  ("term", pq), [1]),
+        ], concl=goal)
+    if label == "conj_of_eqs":
+        # goal = mk_conj(mk_eq(a, a), mk_eq(b, b))
+        eq_aa = goal[1][2]                       # the LHS conjunct
+        eq_bb = goal[2]                          # the RHS conjunct
+        a = eq_aa[2]                             # a:nat
+        b = eq_bb[2]                             # b:nat
+        return T.Cert(steps=[
+            T.Step(1, "REFL", ("term", a), []),
+            T.Step(2, "REFL", ("term", b), []),
+            T.Step(3, "CONJ", ("none",),   [1, 2]),
+        ], concl=goal)
+    if label == "abs_impl":
+        # goal = mk_imp(a=b, λx.a = λx.b)
+        eq_ab = goal[1][2]                       # (a=b)
+        lam_a = goal[2][1][2]                    # λx.a — Abs(x_name, ty, a)
+        name_x = lam_a[1]; ty_x = lam_a[2]
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", eq_ab),            []),
+            T.Step(2, "ABS",    ("var", name_x, ty_x),      [1]),
+            T.Step(3, "DISCH",  ("term", eq_ab),            [2]),
+        ], concl=goal)
+    if label == "spec_twice":
+        # goal = mk_imp((∀x. ∀y. x=x), n=n)
+        forall_term = goal[1][2]                 # the universal
+        eq_n_n = goal[2]                         # n=n
+        n = eq_n_n[2]                            # n:nat
+        # second SPEC at step 3 needs any witness of the inner bound's type;
+        # use the same n to avoid introducing an extra free variable.
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", forall_term), []),
+            T.Step(2, "SPEC",   ("term", n),           [1]),
+            T.Step(3, "SPEC",   ("term", n),           [2]),
+            T.Step(4, "DISCH",  ("term", forall_term), [3]),
+        ], concl=goal)
+    if label == "double_gen_imp":
+        # goal = mk_imp(p:bool, ∀x:nat. ∀y:bool. p:bool)
+        p = goal[1][2]                           # p:bool
+        outer_abs = goal[2][2]                   # Abs(name_x, nat, ∀y:bool. p)
+        name_x = outer_abs[1]; ty_x = outer_abs[2]
+        inner_forall = outer_abs[3]
+        inner_abs = inner_forall[2]
+        name_y = inner_abs[1]; ty_y = inner_abs[2]
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", p),                  []),
+            T.Step(2, "GEN",    ("var", name_y, ty_y),        [1]),
+            T.Step(3, "GEN",    ("var", name_x, ty_x),        [2]),
+            T.Step(4, "DISCH",  ("term", p),                  [3]),
+        ], concl=goal)
+    if label == "eq_trans_impl":
+        # goal = mk_imp(a=b, mk_imp(b=c, a=c))
+        eq_ab = goal[1][2]
+        eq_bc = goal[2][1][2]
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", eq_ab), []),
+            T.Step(2, "ASSUME", ("term", eq_bc), []),
+            T.Step(3, "TRANS",  ("none",),       [1, 2]),
+            T.Step(4, "DISCH",  ("term", eq_bc), [3]),
+            T.Step(5, "DISCH",  ("term", eq_ab), [4]),
+        ], concl=goal)
+    if label == "mk_comb_impl":
+        # goal = mk_imp(f=g, mk_imp(a=b, f a = g b))
+        eq_fg = goal[1][2]
+        eq_ab = goal[2][1][2]
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME",  ("term", eq_fg), []),
+            T.Step(2, "ASSUME",  ("term", eq_ab), []),
+            T.Step(3, "MK_COMB", ("none",),       [1, 2]),
+            T.Step(4, "DISCH",   ("term", eq_ab), [3]),
+            T.Step(5, "DISCH",   ("term", eq_fg), [4]),
+        ], concl=goal)
+    if label == "comp_imp":
+        # goal = (p==>q) ==> (q==>r) ==> (p==>r)
+        p_imp_q   = goal[1][2]
+        q_imp_r   = goal[2][1][2]
+        p         = p_imp_q[1][2]
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", p_imp_q), []),
+            T.Step(2, "ASSUME", ("term", q_imp_r), []),
+            T.Step(3, "ASSUME", ("term", p),       []),
+            T.Step(4, "MP",     ("none",),         [1, 3]),
+            T.Step(5, "MP",     ("none",),         [2, 4]),
+            T.Step(6, "DISCH",  ("term", p),       [5]),
+            T.Step(7, "DISCH",  ("term", q_imp_r), [6]),
+            T.Step(8, "DISCH",  ("term", p_imp_q), [7]),
+        ], concl=goal)
+    if label == "conj_assoc":
+        # goal = ((p /\ q) /\ r) ==> (p /\ (q /\ r))
+        outer_left = goal[1][2]                  # (p /\ q) /\ r
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME",    ("term", outer_left), []),
+            T.Step(2, "CONJUNCT1", ("none",),            [1]),  # p /\ q
+            T.Step(3, "CONJUNCT2", ("none",),            [1]),  # r
+            T.Step(4, "CONJUNCT1", ("none",),            [2]),  # p
+            T.Step(5, "CONJUNCT2", ("none",),            [2]),  # q
+            T.Step(6, "CONJ",      ("none",),            [5, 3]),  # q /\ r
+            T.Step(7, "CONJ",      ("none",),            [4, 6]),  # p /\ (q /\ r)
+            T.Step(8, "DISCH",     ("term", outer_left), [7]),
+        ], concl=goal)
+    if label == "triple_conj_intro":
+        # goal = p ==> q ==> r ==> (p /\ q /\ r)
+        p       = goal[1][2]                     # p
+        q       = goal[2][1][2]                  # q
+        r       = goal[2][2][1][2]               # r
+        return T.Cert(steps=[
+            T.Step(1, "ASSUME", ("term", p), []),
+            T.Step(2, "ASSUME", ("term", q), []),
+            T.Step(3, "ASSUME", ("term", r), []),
+            T.Step(4, "CONJ",   ("none",),   [2, 3]),  # q /\ r
+            T.Step(5, "CONJ",   ("none",),   [1, 4]),  # p /\ (q /\ r)
+            T.Step(6, "DISCH",  ("term", r), [5]),
+            T.Step(7, "DISCH",  ("term", q), [6]),
+            T.Step(8, "DISCH",  ("term", p), [7]),
+        ], concl=goal)
     raise ValueError(f"no gold cert for {label}")
 
 # ---------------------------------------------------------------------------
