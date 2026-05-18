@@ -74,6 +74,16 @@ VERIFIER_BIN     = os.environ.get(
     "HOL_VERIFIER_BIN",
     os.path.join(HERE, "_build", "default", "bin", "verify_tokens.exe"),
 )
+# Continuous-training knobs.  When SYNTH_PER_ROUND > 0, the trainer
+# generates this many synthetic-backward samples per round, appends them
+# to the buffer JSONL, and includes them in subsequent SFT epochs.  This
+# is the "continuously expanding corpus" loop: each round both
+# (a) accepts model-discovered certs and (b) extends the corpus with
+# new kernel-valid proof shapes that the generator stumbles into.
+SYNTH_PER_ROUND  = int(os.environ.get("HOL_EXPIT_SYNTH_PER_ROUND", "0"))
+SYNTH_MIN_DEPTH  = int(os.environ.get("HOL_EXPIT_SYNTH_MIN_DEPTH",  "2"))
+SYNTH_MAX_DEPTH  = int(os.environ.get("HOL_EXPIT_SYNTH_MAX_DEPTH",  "8"))
+SYNTH_VARIANTS   = int(os.environ.get("HOL_EXPIT_SYNTH_VARIANTS",   "10"))
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -131,9 +141,13 @@ def load_buffer_jsonl(path: str) -> Tuple[List[BufferEntry], Set[Tuple[tuple, tu
 
 
 def append_buffer_jsonl(path: str, entries: List[BufferEntry]):
+    """Append entries to the JSONL and fsync — so a crash never loses
+    a verified discovery the trainer already accepted."""
     with open(path, "a") as f:
         for e in entries:
             f.write(json.dumps(asdict(e)) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def init_buffer_from_corpus() -> Tuple[List[BufferEntry], Set[Tuple[tuple, tuple]]]:
@@ -200,6 +214,8 @@ def append_novel_jsonl(path: str, entries):
     with open(path, "a") as f:
         for e in entries:
             f.write(json.dumps(e) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +400,10 @@ def greedy_eval(model: HOLGPT, vpool: VerifierPool) -> List[Tuple[str, int, int]
 # Checkpointing.
 # ---------------------------------------------------------------------------
 def save_ckpt(path, model, optim, round_idx):
+    """Atomic checkpoint save: write to <path>.tmp then rename.
+    Protects against a mid-write crash (machine reboot, OOM, kill -9)
+    leaving a truncated .pt that can't be loaded on resume."""
+    tmp = path + ".tmp"
     torch.save({
         "model": model.state_dict(),
         "optim": optim.state_dict(),
@@ -395,15 +415,84 @@ def save_ckpt(path, model, optim, round_idx):
             "temperature": TEMPERATURE,
             "upweight": UPWEIGHT, "lr": LR, "seed": SEED,
         },
-    }, path)
+    }, tmp)
+    os.replace(tmp, path)
     log(f"checkpoint saved at round {round_idx}")
 
 
 def load_ckpt(path, model, optim):
-    ckpt = torch.load(path, map_location=DEVICE)
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model"])
     optim.load_state_dict(ckpt["optim"])
     return int(ckpt.get("round", 0))
+
+
+# ---------------------------------------------------------------------------
+# Continuous corpus expansion.  Each round, generate K new synthetic-
+# backward samples, append them to the buffer JSONL (durable across
+# crashes), and add them to the in-memory buffer so the next SFT pass
+# sees them.
+# ---------------------------------------------------------------------------
+def expand_corpus_synthetic(buffer: List[BufferEntry],
+                              buffer_keys: set,
+                              n_samples: int,
+                              round_idx: int,
+                              rng: random.Random) -> int:
+    """Generate up to n_samples kernel-valid (goal, cert) pairs and
+    append them as buffer entries.  Returns the number actually added
+    (after dedup + length cap).  Skips if the synth package isn't
+    importable so the trainer still works in environments without it.
+    """
+    if n_samples <= 0:
+        return 0
+    try:
+        sys.path.insert(0, HERE)
+        from synth.backward_gen import generate_one, encode_pair, variant_of
+    except ImportError as e:
+        log(f"synth unavailable: {e}")
+        return 0
+
+    added: List[BufferEntry] = []
+    attempts = 0
+    seen_now = set(buffer_keys)  # local copy for fast lookup
+    while len(added) < n_samples and attempts < n_samples * 8:
+        attempts += 1
+        depth = rng.randint(SYNTH_MIN_DEPTH, SYNTH_MAX_DEPTH)
+        gr = generate_one(rng, depth)
+        if gr is None:
+            continue
+        variants = [gr]
+        for _ in range(SYNTH_VARIANTS - 1):
+            v = variant_of(gr, rng)
+            if v is not None:
+                variants.append(v)
+        for vr in variants:
+            if len(added) >= n_samples:
+                break
+            try:
+                cert_toks, goal_toks, _c_hdr, _g_hdr = encode_pair(vr)
+            except Exception:
+                continue
+            if len(cert_toks) + len(goal_toks) + 3 > BLOCK_SIZE:
+                continue
+            key = (tuple(goal_toks), tuple(cert_toks))
+            if key in seen_now:
+                continue
+            seen_now.add(key)
+            entry = BufferEntry(
+                goal_toks=list(goal_toks),
+                cert_toks=list(cert_toks),
+                source="synthetic",
+                discovered_round=round_idx,
+            )
+            added.append(entry)
+
+    if added:
+        append_buffer_jsonl(BUFFER_PATH, added)
+        buffer.extend(added)
+        for e in added:
+            buffer_keys.add(_key(e))
+    return len(added)
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +632,18 @@ def main():
                 f"{sum(per_seed_success)} verified (+100), "
                 f"{len(new_entries)} new unique → buffer={len(buffer)} "
                 f"({t_sample:.1f}s sample / {t_verify:.1f}s verify)")
+
+            # 3b) Continuous corpus expansion: append fresh synthetic-
+            # backward samples to the buffer.  These extend the rule-
+            # shape distribution the model sees in the next SFT pass
+            # without requiring an offline corpus rebuild.
+            if SYNTH_PER_ROUND > 0:
+                t_syn = time.time()
+                rng = random.Random(SEED + round_idx * 1009)
+                n_added = expand_corpus_synthetic(
+                    buffer, buffer_keys, SYNTH_PER_ROUND, round_idx, rng)
+                log(f"  synthesised {n_added} new corpus samples "
+                    f"({time.time() - t_syn:.1f}s) → buffer={len(buffer)}")
             if novel_shapes_this_round:
                 log(f"  *** NOVEL rule sequences this round: {len(novel_shapes_this_round)} unique, {len(novel_records)} total ***")
                 for shape, (lbl, n_toks) in novel_shapes_this_round.items():
