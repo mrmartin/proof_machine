@@ -601,9 +601,19 @@ def variant_of(gr: GenResult, rng: random.Random) -> Optional[GenResult]:
     if not collected:
         return gr
 
-    # Build a renaming.
+    # Build a renaming.  Critical invariant: the renaming must be
+    # injective across (name, ty_str) keys.  Two source variables that
+    # collide into the same destination name break rules like INST
+    # whose witness requires distinct LHS variables — the kernel
+    # rejects the cert on reverify and the sample silently disappears,
+    # biasing the kept distribution toward variants whose renaming
+    # happens to avoid collisions.
+    #
+    # If we exhaust the pool of fresh names, the right answer is to
+    # bail out (return None) rather than fall back to a used name and
+    # corrupt the variant.
     table = {}
-    used = {nm for (nm, _) in collected}
+    used_new: set = set()
     for (old, ty_str) in collected:
         if ty_str.startswith("nat") or ty_str == "nat()":
             pool = VAR_POOL_NAT
@@ -611,13 +621,16 @@ def variant_of(gr: GenResult, rng: random.Random) -> Optional[GenResult]:
             pool = VAR_POOL_BOOL
         else:
             pool = VAR_POOL_NAT + VAR_POOL_BOOL
-        cands = [p for p in pool if p not in used and p != old]
+        # A name is "available" if no other source variable has already
+        # been mapped to it.  We also exclude `old` so the rename
+        # actually changes the name (otherwise variants degenerate to
+        # the original).
+        cands = [p for p in pool if p not in used_new and p != old]
         if not cands:
-            cands = pool
+            return None  # no injective renaming possible — skip variant
         new = rng.choice(cands)
         table[(old, ty_str)] = new
-        used.discard(old)
-        used.add(new)
+        used_new.add(new)
 
     new_steps = []
     for s in gr.steps:

@@ -38,3 +38,6 @@ hol_expit_v3_novel.jsonl
 
 # Run-time artefacts
 runs/
+
+# Buffer backups from synth/clean_buffer.py
+hol_expit_buffer.jsonl.preclean
