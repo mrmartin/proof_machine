@@ -85,7 +85,11 @@ let override_names (hdr : Encode.pool_header) (names : string list) : Encode.poo
 (* Parse either the legacy protocol (cert_len cert_toks goal_len goal_toks)
    or the extended one (H n_cn <cn0..> n_gn <gn0..> cert_len cert_toks ...).
    The extended form lets the client pass the *original* NAME-pool entries
-   so that constants and axiom names round-trip through verification. *)
+   so that constants and axiom names round-trip through verification.
+
+   A third mode (prefix verification) is prefixed with "P <k>" and skips
+   the goal-tokens field — the response is a structured readback of the
+   theorem table after [k] steps.  See [handle_prefix_request] below. *)
 let handle_request (line : string) : int =
   try
     let parts =
@@ -137,7 +141,117 @@ let handle_request (line : string) : int =
        | Verify.Reject _ -> -1)
   with _ -> -1
 
+(* --- Prefix-mode response -------------------------------------------- *)
+
+(* Serialise a list of theorems against a starting pool header, emitting:
+
+     OK <k> <step_id_0> <n_hyps_0> <hyp_0_len_0> <hyp_0_toks_0...> ...
+            <concl_len_0> <concl_toks_0...> <step_id_1> ...
+
+   Slots not present in [start_hdr] are appended on first sight so each
+   subsequent encoding sees the cumulative pool.  Token IDs round-trip
+   against the original cert pool exactly when every name in derived
+   theorems traces back to a witness in the cert (true for the rule set
+   we support).
+
+   Length is unbounded in principle but in practice bounded by the
+   block-size limit the trainer enforces upstream; the response is one
+   line. *)
+let serialise_prefix_ok (start_hdr : Encode.pool_header)
+                        (thms : (int * Thm.t) list) : string =
+  let buf = Buffer.create 256 in
+  Buffer.add_string buf "OK";
+  Buffer.add_char buf ' ';
+  Buffer.add_string buf (string_of_int (List.length thms));
+  let emit_toks arr =
+    Buffer.add_char buf ' ';
+    Buffer.add_string buf (string_of_int (Array.length arr));
+    Array.iter (fun t ->
+      Buffer.add_char buf ' ';
+      Buffer.add_string buf (string_of_int t)) arr
+  in
+  let hdr = ref start_hdr in
+  List.iter (fun (step_id, thm) ->
+    Buffer.add_char buf ' ';
+    Buffer.add_string buf (string_of_int step_id);
+    let hyps = Thm.hyps thm in
+    Buffer.add_char buf ' ';
+    Buffer.add_string buf (string_of_int (List.length hyps));
+    List.iter (fun h ->
+      let (toks, hdr') = Encode.term_with_header !hdr h in
+      hdr := hdr';
+      emit_toks toks) hyps;
+    let (toks, hdr') = Encode.term_with_header !hdr (Thm.concl thm) in
+    hdr := hdr';
+    emit_toks toks) thms;
+  Buffer.contents buf
+
+let handle_prefix_request (line : string) : string =
+  try
+    let parts =
+      String.split_on_char ' ' line
+      |> List.filter (fun s -> s <> "")
+    in
+    let arr = Array.of_list parts in
+    let n = Array.length arr in
+    let idx = ref 0 in
+    let pop_str () =
+      if !idx >= n then failwith "short" else
+      let s = arr.(!idx) in incr idx; s
+    in
+    let pop_int () = int_of_string (pop_str ()) in
+    let pop_names () =
+      let k = pop_int () in
+      let lst = ref [] in
+      for _ = 1 to k do lst := pop_str () :: !lst done;
+      List.rev !lst
+    in
+    let pop_toks () =
+      let k = pop_int () in
+      Array.init k (fun _ -> pop_int ())
+    in
+    (* Consume the leading 'P' marker and the prefix length. *)
+    if !idx >= n || arr.(!idx) <> "P" then failwith "not a prefix request";
+    incr idx;
+    let k = pop_int () in
+    let cert_names =
+      if !idx < n && arr.(!idx) = "H" then begin
+        incr idx;
+        let cn = pop_names () in
+        let _ : string list = pop_names () in  (* goal-names slot unused *)
+        cn
+      end else []
+    in
+    let cert_toks = pop_toks () in
+    let cert_hdr = override_names (infer_header cert_toks) cert_names in
+    match
+      try Some (Decode.cert cert_hdr cert_toks)
+      with _ -> None
+    with
+    | None -> "ERR -1 decode_failed"
+    | Some cert ->
+      (match Verify.verify_prefix cert k with
+       | Verify.Prefix_reject (step_i, _msg) ->
+         Printf.sprintf "ERR %d" step_i
+       | Verify.Prefix_ok thms -> serialise_prefix_ok cert_hdr thms)
+  with _ -> "ERR -1 parse_failed"
+
 (* --- Main loop ----------------------------------------------------- *)
+
+(* Dispatch is based on the leading non-whitespace token.  Prefix-mode
+   requests start with "P "; the legacy and H-prefixed protocols are
+   unchanged and respond with a single integer. *)
+let is_prefix_request (line : string) : bool =
+  let len = String.length line in
+  let rec skip_ws i =
+    if i >= len then i
+    else match line.[i] with
+      | ' ' | '\t' -> skip_ws (i + 1)
+      | _ -> i
+  in
+  let s = skip_ws 0 in
+  s < len && line.[s] = 'P'
+  && (s + 1 = len || line.[s + 1] = ' ' || line.[s + 1] = '\t')
 
 let () =
   set_binary_mode_in stdin false;
@@ -145,8 +259,11 @@ let () =
   try
     while true do
       let line = input_line stdin in
-      let r = handle_request line in
-      print_string (string_of_int r);
+      let response =
+        if is_prefix_request line then handle_prefix_request line
+        else string_of_int (handle_request line)
+      in
+      print_string response;
       print_char '\n';
       (* Force flush after every response so the Python parent can read. *)
       flush stdout

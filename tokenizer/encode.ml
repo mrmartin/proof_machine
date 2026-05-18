@@ -262,3 +262,29 @@ let cert (c : Cert.t) : int array * pool_header =
     vars   = Array.of_list (List.rev ctx.vars);
   } in
   (toks, hdr)
+
+(* --- Term encoding against an existing pool header --------------------
+   Used by [bin/verify_tokens]'s prefix mode to re-emit derived theorems
+   with token IDs that round-trip against the original cert's pool
+   assignments.  Slots not already in the header are appended on first
+   sight (in chronological order) so callers can thread the returned
+   header into the next encoding call. *)
+let ctx_from_header (hdr : pool_header) : ctx =
+  { tycons = List.rev (Array.to_list hdr.tycons);
+    tyvars = List.rev (Array.to_list hdr.tyvars);
+    names  = List.rev (Array.to_list hdr.names);
+    vars   = List.rev (Array.to_list hdr.vars);
+    out    = [] }
+
+let header_of_ctx (ctx : ctx) : pool_header =
+  { tycons = Array.of_list (List.rev ctx.tycons);
+    tyvars = Array.of_list (List.rev ctx.tyvars);
+    names  = Array.of_list (List.rev ctx.names);
+    vars   = Array.of_list (List.rev ctx.vars) }
+
+let term_with_header (hdr : pool_header) (t : Term.term)
+    : int array * pool_header =
+  let ctx = ctx_from_header hdr in
+  encode_term ctx t;
+  let toks = Array.of_list (List.rev ctx.out) in
+  (toks, header_of_ctx ctx)

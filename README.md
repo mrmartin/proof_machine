@@ -146,6 +146,91 @@ search procedure that explores the rule space outside what
 temperature-sampled PDA-masked decoding reaches (beam, MCTS,
 kernel-evaluated tree search).
 
+### Follow-up experiments (M0 / M1 / M2)
+
+The "kernel-evaluated tree search" and "broader corpus" hooks above
+were implemented and run.  Architecture stays fixed at
+`n_layer=2, n_embd=64, block_size=320` throughout, so each result
+isolates a method effect from a capacity effect.
+
+**M0 — sealed `verify_prefix` subcommand.**  `kernel/verify.ml`
+exposes a prefix-mode call that returns the theorem table after
+applying `k` cert steps; `bin/verify_tokens.ml` carries a new `P <k>`
+protocol prefix.  The readback re-uses the same primitive bindings
+as `verify`, so soundness is unchanged.  Tests in
+`tests/test_verify_prefix.py` exercise full-prefix, every-incremental
+prefix, overshoot, and two adversarial corruptions on all 23 seeds.
+
+**M1 — rule-level kernel-pruned tree search at inference.**
+`tree_search_infer.py` implements best-first search at the
+rule-choice position with top-k branching, kernel-pruned step
+expansion (via `verify_prefix`), and a length-normalised log-prob
+priority.  Witness keyword and empty-witness shape are pinned to
+match the chosen rule (a syntactic constraint encoded directly from
+`Cert.apply_step` in `kernel/cert.ml`).  Six configs (k_outer ∈
+{3,5,8}, b_inner ∈ {4,8}, uniform-mix ∈ {0,0.1}, alpha ∈ {0.5,1.0},
+budget up to 2000 kernel calls/seed) all converge to:
+
+    OOD solved with ExitIt baseline checkpoint: 0 / 10
+
+This matches the prior finding's prediction.  At every config tree
+search reaches at most depth 5 on the easier OOD seeds before the
+policy emits witness *content* the kernel rejects.  Two seeds
+(`mk_comb_impl`, `conj_assoc`) hit depth-0 across configs: even
+ASSUME (which appears as a high-prior rule choice) gets a wrong
+witness term.  The bottleneck is the policy's lack of a usable prior
+*conditional on goal structure* — not the absence of a rule-space
+search.
+
+**M2 — backward synthetic corpus generator.**  `synth/backward_gen.py`
+applies random kernel rules forward from random ASSUME/REFL seeds,
+emitting `(goal, gold_cert)` pairs whose conclusion is whatever the
+random walk produced.  A Python shadow of 17 rules drives the walk
+(REFL through INST); every emitted proof is re-verified by the
+OCaml kernel, and the first 200 in any batch are kernel-checked
+unconditionally.  Variant generation via consistent alpha-renaming
+boosts per-shape sample counts.  At 98,818 samples the generator
+covers **19,267 unique rule-sequence shapes** (vs 20 in the curated
+corpus), 0 kernel rejections after the sanity prefix.
+
+Training a fresh ExitIt checkpoint on `curated + synthetic` (87,800
+buffer entries, 2000 bootstrap SFT steps, 8 rounds) and re-running
+flat sampling on the 23-seed test set:
+
+| Method                 | Solved (greedy) | Solved (T=1.0, 64 samples) | Novel rule shapes |
+|---|---|---|---|
+| Baseline ExitIt        | 13/23 | 13/23 (warmup + beta_inst_identity) | 0 |
+| Synthetic ExitIt       | 4–6/23 (round-to-round) | 13/23 incl. **`conj_of_eqs` (OOD)** with a novel rule sequence | **76 certs across 59 unique novel shapes** |
+
+The synthetic-trained run produces certificates whose rule sequences
+are not in the curated corpus baseline.  Solves on warmup seeds use
+*invented* compositions of rules (e.g. proving `REFL` of a variable
+via `ASSUME-DISCH-REFL` instead of bare `REFL`) — the model is
+clearly composing, not template-recalling.  The single OOD solve
+(`conj_of_eqs` via a novel shape) is a thin signal but on the right
+side of zero, and the 59 unique novel shapes during training is
+where composition mostly shows up.
+
+Tree search on top of the synthetic checkpoint did not multiply
+further at the configs we tried (1B-b @ 1000 kernel calls/seed
+solves 11/23, slightly under flat sampling) — likely because the
+witness *content* problem still binds even when the rule prior is
+sharper.  Proof-state exposure (M3) is the natural next move and is
+unimplemented here.
+
+**Combined takeaway.**  The 0/10 OOD result under tree search alone
+confirms that rule-space exploration with an unconditional-witness
+policy doesn't compose.  The shift to a synthetic corpus moves the
+needle: the model produces 76 verified certs with novel rule
+sequences and solves one OOD seed by an invented composition.  That
+is the first crack in template-recall at this scale.  The remaining
+binding constraint is witness-content selection, which is exactly
+what state-conditional decoding (M3) is supposed to fix.
+
+Run artefacts under `runs/`: `m1_eval.log`, `m2_train_v3.log`,
+`m2_eval.log`, `m2_eval.csv` (partial), and the synthetic corpus
+itself at `hol_synth_corpus_v3.jsonl`.
+
 ### Built-in novelty instrumentation
 
 `microgpt_expit.py` computes `CORPUS_RULE_SHAPES` at module load and

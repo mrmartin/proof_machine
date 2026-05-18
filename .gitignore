@@ -27,3 +27,14 @@ __pycache__/
 # RL training artefacts — checkpoints are large binaries; logs are
 # already covered by *.log above.
 *.pkl
+*.pt
+
+# Synthetic corpus and ExitIt buffers (regeneratable, large)
+hol_synth_corpus*.jsonl
+hol_expit_buffer*.jsonl
+hol_expit_novel*.jsonl
+hol_expit_synth*.jsonl
+hol_expit_v3_novel.jsonl
+
+# Run-time artefacts
+runs/
