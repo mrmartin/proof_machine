@@ -231,6 +231,100 @@ Run artefacts under `runs/`: `m1_eval.log`, `m2_train_v3.log`,
 `m2_eval.log`, `m2_eval.csv` (partial), and the synthetic corpus
 itself at `hol_synth_corpus_v3.jsonl`.
 
+### Long continuous run (rounds 1–500, adaptive sampler at 201–500)
+
+The first 500-round continuous run produced two phases:
+
+- **Rounds 1–200** (fixed `RULE_BIAS` synth sampler).  Buffer grew to
+  483K entries.  Greedy solve rate plateaued at a mean of **9.77/23**
+  with the OOD seeds wobbling between 0 and 1 solves and several
+  in-distribution seeds (`conj_swap`, `k_combinator`) under 20%.
+- **Rounds 201–500** (adaptive inverse-frequency synth sampler at
+  `HOL_EXPIT_SYNTH_TEMP=2.0`).  Buffer grew to 1.13M entries.  Greedy
+  solve rate rose to a mean of **13.34/23** (rolling mean of the last
+  100 rounds: **14.09/23**) and three previously-uncrackable OOD
+  seeds began solving.
+
+The change between phases is one and only one thing: the synth
+generator's rule-choice distribution.  Architecture, kernel, PDA,
+SFT loss, exploration temperature, and verifier are all unchanged.
+See [the adaptive-sampler section in CLAUDE.md](CLAUDE.md) for the
+exact scoring formula and tuning history.
+
+**Per-seed solve rate, phase comparison.**
+
+| Seed | Phase 1 (≤200) | Phase 2 (201–500) | Δ | Note |
+|---|---:|---:|---:|---|
+| `refl_x`/`y`/`n`                 |  99% |100% | +1  | warmup |
+| `refl_p_bool`/`q_bool`           |  96% |100% | +4  | warmup |
+| `imp_p` / `imp_q`                |  70% | 98% | +28 | the originally REINFORCE-stuck seeds |
+| `prime_imp_prime`                |  59% | 99% | +40 |     |
+| `conj_proj_left`                 |  71% | 98% | +28 |     |
+| `conj_swap`                      |  14% | 52% | +38 |     |
+| `k_combinator`                   |  17% | 63% | +46 |     |
+| `gcd_refl`                       |  98% | 95% | −4  | mild regression |
+| `disj_imp_self`                  |  59% | 98% | +39 |     |
+| `conj_of_eqs`                    |  19% | 28% | +9  | OOD |
+| `abs_impl`                       |   0% | 16% | +16 | **first solve, OOD** |
+| `spec_twice`                     |   0% |  1% | +1  | **first solve, OOD** (`ASSUME→SPEC→SPEC→DISCH`) |
+| `eq_trans_impl`                  |   0% |  1% | +1  | **first solve, OOD** |
+| `comp_imp`                       |   0% |  1% | +1  | **first solve, OOD** |
+| `beta_inst_identity`             |   0% | 83% |+83  | **first solve, OOD** (was the structural-bottleneck control) |
+| `double_gen_imp`                 |   2% |  1% | −1  | unchanged |
+| `mk_comb_impl`                   |   0% |  0% |  0  | still stuck |
+| `conj_assoc`                     |   0% |  0% |  0  | still stuck |
+| `triple_conj_intro`              |   0% |  0% |  0  | still stuck |
+
+Peak round: **17/23 solved** in two distinct rounds (e.g. at round
+~464, where `spec_twice` solved alongside everything in the
+"reliably-solved" cluster).  The 17/23 ceiling is structural —
+`mk_comb_impl`, `conj_assoc`, `triple_conj_intro` and
+`double_gen_imp` use rule shapes the adaptive sampler hasn't yet
+made common enough at their required positions.
+
+**Cumulative novelty.**  From the end-of-run novelty summary:
+
+- corpus baseline rule-sequence shapes: **20**
+- novel certs discovered:               **64,141**
+- across unique novel shapes:           **28,009**
+
+That is a ≈1,400× expansion of the rule-shape distribution the
+model has been trained on, all kernel-verified.  Most of those
+shapes are not solving test seeds, but the existence of the
+`beta_inst_identity` / `abs_impl` / `spec_twice` solves shows the
+SFT loss is in fact transferring compositional structure out of the
+synthetic distribution into the policy.
+
+**The `beta_inst_identity` unlock is the cleanest signal.**  This
+seed was previously the canonical "structural bottleneck"
+demonstration: in the M2 README paragraph above, adding its rule
+shape to the corpus took it from V=+0 to 32/32 success
+instantaneously, while no other OOD seed transferred.  Under the
+adaptive sampler, the seed solves greedily in 83% of evaluation
+rounds *without* any hand-curated insertion of its shape — the
+generator's broader rule distribution made the composition
+discoverable on its own.
+
+**Throughput.**  Each round of phase 2 runs in ~75 s on the
+trainer's single GPU: ~7 s exploration, ~40 s synth (of which ~32 s
+is the per-round buffer scan to rebuild the position-frequency
+table), ~25 s SFT, ~14 s eval.  Buffer scan cost grows linearly
+with buffer size; at 1.13M entries it has not yet become the
+bottleneck but will overtake SFT around 2–3M entries.  A persistent
+incrementally-updated counter would erase that cost when needed.
+
+**What is *not* claimed.**  The 17/23 peak is one round, not a
+trend; the rolling-100-round mean is 14.09.  Greedy eval is also a
+single sample — temperature sampling at T=1.0 with 64 attempts per
+seed (what the M2 paragraph reported) would solve more.  And the
+four still-unsolved seeds need either Change 2/3 of the sampler
+work, more synthetic diversity at the right positions, or M3-style
+proof-state exposure to fix.  The combined takeaway from the M2
+section above — *witness-content selection is the binding
+constraint* — still holds: most of the OOD-seed misses we see at
+greedy eval are now correct-rule-sequence-wrong-witness, not
+correct-witness-wrong-rule.
+
 ### Built-in novelty instrumentation
 
 `microgpt_expit.py` computes `CORPUS_RULE_SHAPES` at module load and

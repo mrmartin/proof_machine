@@ -84,6 +84,12 @@ SYNTH_PER_ROUND  = int(os.environ.get("HOL_EXPIT_SYNTH_PER_ROUND", "0"))
 SYNTH_MIN_DEPTH  = int(os.environ.get("HOL_EXPIT_SYNTH_MIN_DEPTH",  "2"))
 SYNTH_MAX_DEPTH  = int(os.environ.get("HOL_EXPIT_SYNTH_MAX_DEPTH",  "8"))
 SYNTH_VARIANTS   = int(os.environ.get("HOL_EXPIT_SYNTH_VARIANTS",   "10"))
+# Temperature for the adaptive inverse-frequency rule sampler in
+# synth/backward_gen.py.  T=2.0 is the empirically tuned default
+# (pos-0 entropy 1.02, MK_COMB ~2.2% in a 1000-sample probe vs 0.18 /
+# 1.2% baseline).  Lower T over-corrects toward BETA; higher T flattens
+# the inverse-freq boost so rare-rule prevalence stops rising.
+SYNTH_TEMP       = float(os.environ.get("HOL_EXPIT_SYNTH_TEMP",      "2.0"))
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -447,10 +453,22 @@ def expand_corpus_synthetic(buffer: List[BufferEntry],
         return 0
     try:
         sys.path.insert(0, HERE)
-        from synth.backward_gen import generate_one, encode_pair, variant_of
+        from synth.backward_gen import generate_one, encode_pair, variant_of, GeneratorState
+        from synth.freq_counter import build_from_buffer
     except ImportError as e:
         log(f"synth unavailable: {e}")
         return 0
+
+    # Build a position-aware rule-frequency snapshot from the persistent
+    # buffer, then thread it through generate_one as an adaptive sampler
+    # state.  Per-batch attempts/successes are tracked online; freq.bump
+    # inside the generator gives within-round feedback so the 2000-sample
+    # batch self-balances rather than the first sample dominating.
+    t_freq = time.time()
+    freq = build_from_buffer(BUFFER_PATH)
+    gen_state = GeneratorState(freq=freq, temperature=SYNTH_TEMP)
+    log(f"  synth sampler: freq snapshot in {time.time()-t_freq:.1f}s "
+        f"({freq.total_proofs} proofs, T={SYNTH_TEMP})")
 
     added: List[BufferEntry] = []
     attempts = 0
@@ -458,7 +476,7 @@ def expand_corpus_synthetic(buffer: List[BufferEntry],
     while len(added) < n_samples and attempts < n_samples * 8:
         attempts += 1
         depth = rng.randint(SYNTH_MIN_DEPTH, SYNTH_MAX_DEPTH)
-        gr = generate_one(rng, depth)
+        gr = generate_one(rng, depth, state=gen_state)
         if gr is None:
             continue
         variants = [gr]

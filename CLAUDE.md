@@ -72,9 +72,30 @@ All knobs are env vars; defaults are in `scripts/train_continuous.sh`.
 | `HOL_EXPIT_SYNTH_PER_ROUND`      | synth samples appended per round | 2000 |
 | `HOL_EXPIT_SYNTH_MIN_DEPTH`      | min synth proof depth | 2 |
 | `HOL_EXPIT_SYNTH_MAX_DEPTH`      | max synth proof depth | 10 |
+| `HOL_EXPIT_SYNTH_TEMP`           | adaptive inverse-freq sampler temperature (lower = stronger rare-rule boost; T=1.0 over-corrects to BETA at position 0; T=2.0 is the empirical sweet spot) | 2.0 |
 
 When you change one of these, the change applies to **future rounds
 only** — the corpus + checkpoint from prior rounds are kept.
+
+### Adaptive rule sampler (synth/backward_gen.py)
+
+The synthetic generator no longer uses a fixed `RULE_BIAS`.  Each
+round, `expand_corpus_synthetic` scans `hol_expit_buffer.jsonl` once
+(~15 s on a 500K-entry buffer) to build a position-aware rule
+frequency table, then samples each rule choice by
+
+    score(r) = RULE_BIAS[r] * (succ_rate[r] + ε) / (freq[pos][r] + ε)
+
+with `succ_rate` tracked online for the round, softmax over log-scores
+at `HOL_EXPIT_SYNTH_TEMP`.  The within-round `freq.bump` causes the
+batch to self-balance.
+
+This fixes the corpus position-0 entropy collapse (75% ASSUME / 25%
+REFL) but introduces a known asymmetry: BETA is rare in the corpus
+*and* easy to apply, so at low temperature it over-corrects.  T=2.0
+is a tuned trade-off.  If you see BETA dominating position 0 of new
+samples, raise T to 3–4.  If TRANS / MK_COMB are still under 1%, lower
+T to 1.5.
 
 ## Inspecting progress
 
