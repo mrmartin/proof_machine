@@ -176,19 +176,19 @@ def _is_eq_concl(s: ProofStep) -> bool:
             and c[1][1][1] == "=")
 
 
-def _hyp_carrying(s: ProofStep) -> bool:
-    """Step transitively depends on at least one ASSUME — i.e. has a
-    non-empty hypothesis set in the kernel sense.  Uses the probe-only
-    provenance metadata."""
-    return s.provenance is not None and "ASSUME" in s.provenance
+def _is_conj_concl(c: tuple) -> bool:
+    return (bool(c) and c[0] == "Comb"
+            and c[1][0] == "Comb"
+            and c[1][1][0] == "Const"
+            and c[1][1][1] == "/\\")
 
 
 def _gen_side_cond_anywhere(steps: List[ProofStep]) -> bool:
     """Is there any step on which GEN could fire — i.e. a free var in
     its conclusion that is not also free in any of its hypotheses?
-    This is GEN's side condition (line 297 of _try_apply).  We check
-    it across the pool because the question 'is GEN positioned-ready'
-    is exactly: does such a step exist."""
+    This is GEN's side condition.  We check it across the pool because
+    the question 'is GEN positioned-ready' is exactly: does such a
+    step exist."""
     for s in steps:
         fvs = S.free_vars(s.thm.concl)
         for (name, ty) in fvs:
@@ -197,23 +197,64 @@ def _gen_side_cond_anywhere(steps: List[ProofStep]) -> bool:
     return False
 
 
+def _freeze_term(x):
+    """Recursively convert lists to tuples so a term tree becomes
+    hashable.  Types in this representation use lists for their arg
+    lists (e.g. `('Tyapp', 'bool', [])`), which makes the bare concl
+    unhashable.  Walking the structure once produces a deterministic
+    nested tuple suitable for set membership."""
+    if isinstance(x, (list, tuple)):
+        return tuple(_freeze_term(v) for v in x)
+    return x
+
+
+def _distinct_assume_concls(steps: List[ProofStep]) -> set:
+    """Set of distinct hypothesis terms introduced by ASSUME rules in
+    the pool.  Two derived steps sharing one ASSUME ancestor contribute
+    one entry, not two — which is the kernel-level notion of
+    'independent hypothesis' the four gold shapes actually need."""
+    return {_freeze_term(s.thm.concl) for s in steps if s.rule == "ASSUME"}
+
+
 def _precond_flags(applicable: List[str],
                     steps: List[ProofStep]) -> Dict[str, bool]:
     """Per-target-shape readiness flags at the current walk state.
 
-    These match the brief's positioned-precondition definitions:
-    a rule being in `applicable` is the unigram check; these flags
-    additionally require the *kind* of premises the gold shape needs
-    (hypothesis-carrying, not REFL/ABS-derived)."""
-    hyp_eq    = sum(1 for s in steps if _is_eq_concl(s) and _hyp_carrying(s))
-    hyp_bool  = sum(1 for s in steps if S.is_bool(s.thm.concl) and _hyp_carrying(s))
-    has_hyp   = any(_hyp_carrying(s) for s in steps)
-    gen_ok    = "GEN" in applicable and _gen_side_cond_anywhere(steps)
+    Counts DISTINCT ASSUME ancestors, not derived hyp-carrying steps:
+    a single ASSUME with two CONJUNCT descendants represents one
+    independent hypothesis, not three.  This is what the gold shapes
+    actually require — see commit message of the predicate-fix commit
+    for the rationale.
+
+    Mapping from shape to precondition:
+
+    - mk_comb_impl:      2 distinct ASSUMEs whose concls are equalities
+                         (the gold proof ASSUMEs `f=g` and `a=b`).
+    - double_gen_imp:    1 distinct ASSUME + GEN's side cond satisfiable
+                         (gold ASSUMEs `p` then GEN-GEN-DISCH; needs
+                         only one hypothesis but the var-free-in-hyps
+                         check has to be passable).
+    - conj_assoc:        1 distinct ASSUME whose concl is a (possibly
+                         nested) conjunction — that single hyp drives
+                         the CONJUNCT1-CONJUNCT2-CONJ-CONJ chain.
+    - triple_conj_intro: 3 distinct ASSUMEs (gold ASSUMEs p, q, r —
+                         three independent hyps).
+    """
+    assume_concls = _distinct_assume_concls(steps)
+    n_distinct_assumes  = len(assume_concls)
+    n_eq_assumes        = sum(1 for c in assume_concls
+                              if c and c[0] == "Comb"
+                              and c[1][0] == "Comb"
+                              and c[1][1][0] == "Const"
+                              and c[1][1][1] == "=")
+    has_conj_assume     = any(_is_conj_concl(c) for c in assume_concls)
+    has_any_assume      = n_distinct_assumes >= 1
+    gen_ok              = "GEN" in applicable and _gen_side_cond_anywhere(steps)
     return {
-        "mk_comb_impl_ready":      ("MK_COMB" in applicable) and hyp_eq >= 2,
-        "double_gen_imp_ready":    gen_ok and has_hyp,
-        "conj_assoc_ready":        ("CONJ" in applicable) and hyp_bool >= 2,
-        "triple_conj_intro_ready": ("CONJ" in applicable) and hyp_bool >= 3,
+        "mk_comb_impl_ready":      ("MK_COMB" in applicable) and n_eq_assumes >= 2,
+        "double_gen_imp_ready":    gen_ok and has_any_assume,
+        "conj_assoc_ready":        ("CONJ" in applicable) and has_conj_assume,
+        "triple_conj_intro_ready": ("CONJ" in applicable) and n_distinct_assumes >= 3,
     }
 
 
