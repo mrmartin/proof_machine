@@ -1,0 +1,214 @@
+Diligence answers — 2026-05-25 07:21 UTC
+Repo: proof_machine, branch main, commit 7aa66c2 (clean tree)
+Trainer state at time of write: round 512, buffer 1,153,842 entries
+================================================================
+
+1. BUFFER SCAN / COUNTER
+------------------------
+Measured, not estimated. The trainer logs the snapshot time every
+round as "synth sampler: freq snapshot in X.Xs (N proofs, T=2.0)":
+  - 14.9s at 483K entries (round ~200)
+  - 36.2s at 1.15M entries (round 512, this morning)
+
+What it recomputes: ONLY the position-frequency table, from scratch.
+synth/freq_counter.py:57-84 opens the JSONL, line-by-line, json-
+parses every entry, extracts rule-shape via cert_rule_shape, and
+bumps counts[pos][rule]. No dedup, no re-hashing, no cert re-reading
+beyond the rule tokens.
+
+Beyond the newest round is rescanned because there is no incremental
+persistence. Trivial fix: pickle PositionRuleFreq to disk after each
+round, on resume rescan only the JSONL tail past the last persisted
+offset. ~30s/round saved -> over 9,500 rounds that's ~80h of wall
+time. The README hand-waves this ("a persistent incrementally-
+updated counter would erase that cost when needed") — the time is
+now, not "around 2-3M entries."
+
+
+2. WHAT THE SAMPLER ACTUALLY CONDITIONS ON
+------------------------------------------
+Premise-availability conditioning is genuinely wired. From
+synth/backward_gen.py:614-619:
+
+    applicable = [r for r in rules if _applicable(r, steps)]
+    if not applicable: break
+    rule = _sample_rule(state, len(steps), applicable, rng)
+
+Inverse-frequency softmax runs over the applicable subset only, not
+over a static rule list. Both halves of Change 1 shipped.
+
+Caveat: _applicable (lines 514-535) is a necessary-only check (e.g.
+">=2 equalities exist" for TRANS, not "two share a term"). The rule
+can still fail inside _try_apply's retry loop. So "conditioned on
+premise availability" is correct but loose — exactly what item (d)
+of the sampler list addresses.
+
+
+3. NOVELTY METRIC KEYING
+------------------------
+cert_rule_shape (microgpt_expit.py:186-200) extracts ONLY the ordered
+tuple of rule names by scanning for KW_RULE tokens. No witnesses, no
+terms.
+
+  - Alpha-renamed witnesses -> identical shape ✓
+  - A redundant REFL in the middle -> DIFFERENT shape from the
+    no-REFL version ✗
+
+So 28,009 unique shapes is NOT padded by alpha-renaming (the
+variant_of fix in 1ca363f was about injective renaming, which is
+independent). It IS padded by dead-step variants — ASSUME-REFL-DISCH
+and ASSUME-DISCH both prove p ⊢ p but count as two shapes. There is
+no shape-canonicalisation pass anywhere. Discount the 28,009 figure
+by some unknown factor when reasoning about "actual rule-composition
+breadth".
+
+
+4. GREEDY-VS-SAMPLED GAP
+------------------------
+eval_ood.py supports it: 1A-T1.0 does 64 samples per seed at T=1.0;
+1A-T1.2 and 1B-* (tree search) are also wired. Code is fine.
+
+But every CSV under runs/ (m1_eval.csv, m2_eval_flat.csv,
+eval_ood.csv) has ckpt_round=8 in the last column. That's M2-era.
+Nothing multi-sample has been run on the 500-round checkpoint. The
+per-seed table in README is therefore greedy-only against round 500;
+we have zero data on what 1A-T1.0 does at round 500.
+
+Half-hour experiment, no code changes needed.
+
+
+5. WITNESS-CONTENT CLAIM
+------------------------
+No script exists. Grepping the entire repo for
+witness/wrong-witness/correct-rule returns only README/docs (prose)
+and tree_search_infer.py / test_verify_prefix.py (inference and unit
+tests, not failure analysis). There is no script that classifies
+failed attempts as "correct rule sequence + wrong witness" vs
+"wrong rule sequence."
+
+The README assertion is an impression from log-reading, not a
+measured finding. Treat as a hypothesis until someone writes the
+classifier.
+
+
+6. M1 REPRODUCIBILITY
+---------------------
+Should work, untested at round 500.
+
+  - Checkpoint config: {n_layer: 2, n_head: 4, n_embd: 64,
+    block_size: 320} — matches what eval_ood.py builds.
+  - State-dict keys look standard.
+  - tree_search_infer.py is imported by eval_ood.py with no version
+    guard, and the M1 CSV was produced successfully against
+    ckpt_round=8 with this same code path.
+  - No commits to tree_search_infer.py or kernel_client.py since M2
+    shipped (latest commit on them is 6b2fca1, May 18).
+
+Read: re-running M1 against round 500 is an afternoon, not a week.
+Risk is some grammar or verifier-protocol edge case that does not
+fire at round 8 but does at round 500 (e.g. a new rule the model
+produces that tree_search_infer's witness-keyword mapping at
+line 60-80 has not enumerated). Easy to discover by just running it.
+Smoke-test before planning around it.
+
+
+7. FOUR STUCK SEEDS — SHAPE PRESENCE IN BUFFER
+----------------------------------------------
+Most consequential finding. Scanned all 1,153,842 buffer entries:
+
+  Seed                  Gold rule shape                                                Matches
+  mk_comb_impl          ASSUME-ASSUME-MK_COMB-DISCH-DISCH                              0
+  conj_assoc            ASSUME-CONJUNCT1-CONJUNCT2-CONJUNCT1-CONJUNCT2-CONJ-CONJ-DISCH 0
+  triple_conj_intro     ASSUME-ASSUME-ASSUME-CONJ-CONJ-DISCH-DISCH-DISCH               0
+  double_gen_imp        ASSUME-GEN-GEN-DISCH                                           0
+
+Zero. After 1.15M synthetic samples and 64K discoveries, the model
+has never seen the exact rule sequence it needs to emit for any of
+the four stuck seeds. This is a corpus-coverage gap, not a capacity
+wall. The intervention should be sampler / corpus work (a/b/d), NOT
+M3. M3 would help if these were "shape present but witness wrong" —
+they are not.
+
+(The double_gen_imp result is particularly striking: it is only 4
+rules and the simplest shape of the four. The adaptive sampler at
+T=2.0 still has not produced it.)
+
+
+8. KERNEL SANITY PREFIX
+-----------------------
+The CLAUDE.md note "the OCaml kernel re-verifies the first 200 of
+every batch as a sanity prefix" is NOT true for the continuous-
+trainer path.
+
+expand_corpus_synthetic (microgpt_expit.py:442-513) has no
+KernelClient call, no vpool.verify, no reverify of any kind. The
+continuous-trainer synth path appends entries to the buffer based on
+Python-shadow correctness alone.
+
+The "first 200" sanity is in synth/build_corpus.py:75 (the offline
+corpus builder, separate codepath, kernel-verifies first 50 unless
+--reverify is set). That script was not used in the continuous run.
+
+Kernel-verified fraction of the current 1.15M buffer:
+  - ~1,600 corpus seeds: verified via curated gold ✓
+  - ~64K discovered certs: kernel-verified by vpool.verify_batch ✓
+  - ~1.08M synthetic-backward certs: NOT kernel-verified at
+    insertion
+
+That is ~95% of the buffer trusting the Python shadow. Commit
+1ca363f literally fixed a 0.4% shadow->kernel contamination bug
+already. The exposure pattern is the same.
+
+A periodic synth/audit_buffer.py sweep would tell us the current
+actual drift rate. If still <=0.4%, fine; if higher, the SFT
+distribution has been training on partly-fictional rules for the
+last 300+ rounds.
+
+
+9. COMMITTED STATE VS RUN STATE
+-------------------------------
+  - git status: clean.
+  - git diff 7aa66c2 -- synth/backward_gen.py synth/freq_counter.py
+    microgpt_expit.py: empty.
+  - File mtimes (May 18) predate the commit date (May 24) but match
+    commit content byte-for-byte.
+  - Commit 7aa66c2 message has the full run results table.
+
+The 500-round run is reproducible from 7aa66c2. The current
+checkpoint on disk corresponds to code that is checked in. Tagging
+the commit before launching a longer run gives a known-good
+rollback.
+
+
+================================================================
+SYNTHESIZED TAKEAWAYS (priority order)
+================================================================
+
+1. The four stuck seeds are a corpus-coverage problem, not a
+   capacity or witness problem. The README's "binding constraint is
+   witness-content selection" claim is contradicted by the buffer
+   scan for these specific seeds — their rule shapes are not even
+   present yet. Right move is sampler/corpus work, not M3.
+
+2. ~95% of the buffer is Python-shadow-trust. Given history, run
+   synth/audit_buffer.py against a 10K sample of the current buffer
+   before committing to a multi-week run.
+
+3. The freq-snapshot is a 30+ s/round tax that incremental
+   persistence eliminates. Worth fixing before launching anything
+   long.
+
+4. The witness-content claim and the multi-sample T=1.0 evaluation
+   at round 500 are both missing. Together they are maybe a day of
+   work and would either confirm or falsify the README's
+   "witness-content is the binding constraint" thesis.
+
+5. The 17/23 peak should not be discussed without the rolling-mean.
+   That is already in the README, but is worth keeping front-of-mind.
+
+Concrete actions, none blocks the trainer currently running:
+  (i)   synth/audit_buffer.py on a 10K sample
+  (ii)  make eval-ood --methods 1A-T1.0 1A-T1.2 1B-b against
+        round-512 ckpt
+  (iii) write the rule-vs-witness failure classifier
+  (iv)  implement the incremental freq counter
