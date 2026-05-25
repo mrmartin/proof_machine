@@ -1,0 +1,51 @@
+=== Probe reachability report ===
+  input:           runs/probe_20260525_123426.jsonl
+  walks:           200000
+  complete:        200000 (100.0%)
+
+=== Headline table ===
+
+  seed                 rule         unigram   precond  sample|ctx  apply|ctx shape_hits
+  -------------------- ---------- --------- --------- ----------- ---------- ----------
+  mk_comb_impl         MK_COMB       67.71%     0.45%      10.46%     12.83%          0
+  double_gen_imp       GEN           99.95%    60.35%       7.68%     93.63%          0
+  conj_assoc           CONJ          94.39%     9.84%       8.91%    100.00%          0
+  triple_conj_intro    CONJ          94.39%     6.00%      10.05%    100.00%          0
+
+  Legend:
+    unigram     = % walks where the rule entered _applicable ≥ 1×
+    precond     = % walks where shape-specific precondition was met ≥ 1×
+                  (rule applicable AND hypothesis-context requirement met)
+    sample|ctx  = of (walk,step) pairs with precond met, % where the
+                  inverse-freq sampler picked the target rule
+    apply|ctx   = of times the rule was sampled in-context, % where
+                  _try_apply succeeded
+    shape_hits  = walks whose completed rule shape matches the gold
+
+=== In-context _try_apply failures (Mode B signal) ===
+  mk_comb_impl: 360/413 sampled-in-context applications failed; failure-reason breakdown (472 total reason events, may exceed n_fail if rule's retry loop logs multiple per call):
+      332 ( 70.3%)  mk_comb: pool has no function-typed equality (pre-filter); rule cannot fire
+      140 ( 29.7%)  mk_comb: no eq with type matching the selected function's domain
+  double_gen_imp: 2822/44326 sampled-in-context applications failed; failure-reason breakdown (14110 total reason events, may exceed n_fail if rule's retry loop logs multiple per call):
+    12438 ( 88.2%)  gen: every free var in concl is also free in hyps (side cond unsatisfiable)
+     1672 ( 11.8%)  gen: no free vars in concl
+  conj_assoc: 0 failures (apply succeeded every time the rule was sampled in-context)
+  triple_conj_intro: 0 failures (apply succeeded every time the rule was sampled in-context)
+
+=== Per-shape reads ===
+
+  mk_comb_impl  [Both]
+    unigram reach: 67.71%   precond reach: 0.45%   precond/unigram ratio: 0.007
+    sampled in-context: 413 times, applied successfully: 12.83%
+
+  double_gen_imp  [Neither dominant — examine top failure reasons]
+    unigram reach: 99.95%   precond reach: 60.35%   precond/unigram ratio: 0.604
+    sampled in-context: 44326 times, applied successfully: 93.63%
+
+  conj_assoc  [Neither dominant — examine top failure reasons]
+    unigram reach: 94.39%   precond reach: 9.84%   precond/unigram ratio: 0.104
+    sampled in-context: 7748 times, applied successfully: 100.00%
+
+  triple_conj_intro  [Mode A (applicability starvation)]
+    unigram reach: 94.39%   precond reach: 6.00%   precond/unigram ratio: 0.064
+    sampled in-context: 4119 times, applied successfully: 100.00%

@@ -341,7 +341,14 @@ def _try_apply(rule_name: str,
         return None
 
     if rule_name == "MK_COMB":
-        # Two equalities of compatible types.
+        # Two equalities of compatible types.  The naive sampler picked
+        # any two random equalities from the pool, which rejected 80%+
+        # of the time on "lhs not function" because most ASSUME-derived
+        # and REFL-derived equalities are atom-typed.  Pre-filter: pick
+        # `a` from equalities whose LHS is function-typed, then `b`
+        # from equalities whose LHS type matches `a`'s function domain.
+        # That's an exact restatement of the kernel's `mk_comb` type
+        # check (shadow.py:267-275), so every sampled pair succeeds.
         eq_steps = [s for s in steps
                     if (s.thm.concl[0] == "Comb"
                          and s.thm.concl[1][0] == "Comb"
@@ -349,12 +356,39 @@ def _try_apply(rule_name: str,
                          and s.thm.concl[1][1][1] == "=")]
         if len(eq_steps) < 2:
             return None
-        for _ in range(5):
-            a, b = rng.sample(eq_steps, 2)
+        typed_eqs = []     # all eq steps, paired with their LHS type
+        fn_typed_eqs = []  # subset where LHS is function-typed
+        for s in eq_steps:
             try:
-                thm = S.mk_comb(a.thm, b.thm)
+                lhs, _ = S.dest_eq(s.thm.concl)
+            except S.RuleError:
+                continue
+            t = S.type_of(lhs)
+            typed_eqs.append((s, t))
+            if t[0] == "Tyapp" and t[1] == "fun":
+                fn_typed_eqs.append((s, t))
+        if not fn_typed_eqs:
+            if trace is not None:
+                trace.append((rule_name,
+                              "mk_comb: pool has no function-typed equality "
+                              "(pre-filter); rule cannot fire"))
+            return None
+        for _ in range(5):
+            a_step, a_t = rng.choice(fn_typed_eqs)
+            a_dom = a_t[2][0]
+            matches = [(s, t) for (s, t) in typed_eqs
+                       if s.id != a_step.id and T.type_equal(t, a_dom)]
+            if not matches:
+                if trace is not None:
+                    trace.append((rule_name,
+                                  "mk_comb: no eq with type matching the "
+                                  "selected function's domain"))
+                continue
+            b_step, _ = rng.choice(matches)
+            try:
+                thm = S.mk_comb(a_step.thm, b_step.thm)
                 return ProofStep(next_id, "MK_COMB", ("none",),
-                                 [a.id, b.id], thm)
+                                 [a_step.id, b_step.id], thm)
             except S.RuleError as e:
                 if trace is not None:
                     trace.append((rule_name, str(e)))
@@ -454,12 +488,20 @@ def _try_apply(rule_name: str,
                 if trace is not None:
                     trace.append((rule_name, "gen: no free vars in concl"))
                 continue
-            name, ty = rng.choice(fvs_concl)
-            # GEN requires the var not appear free in hyps.
-            if any(S.has_free(name, ty, h) for h in a.thm.hyps):
+            # GEN's side condition: the bound var must not be free in
+            # any hypothesis.  The previous code sampled then discarded,
+            # which exhausted the 5-iteration retry on legitimately-
+            # usable steps when the chosen var happened to be in hyps.
+            # Pre-filter so every retry consumes a usable candidate.
+            usable = [(name, ty) for (name, ty) in fvs_concl
+                      if not any(S.has_free(name, ty, h) for h in a.thm.hyps)]
+            if not usable:
                 if trace is not None:
-                    trace.append((rule_name, "gen: var free in hyps (side cond)"))
+                    trace.append((rule_name,
+                                  "gen: every free var in concl is also "
+                                  "free in hyps (side cond unsatisfiable)"))
                 continue
+            name, ty = rng.choice(usable)
             v = T.mk_var(name, ty)
             try:
                 thm = S.gen(v, a.thm)
