@@ -1,0 +1,51 @@
+=== Probe reachability report ===
+  input:           runs/probe_20260525_085322.jsonl
+  walks:           200000
+  complete:        200000 (100.0%)
+
+=== Headline table ===
+
+  seed                 rule         unigram   precond  sample|ctx  apply|ctx shape_hits
+  -------------------- ---------- --------- --------- ----------- ---------- ----------
+  mk_comb_impl         MK_COMB       68.19%     3.87%       8.72%     19.30%          0
+  double_gen_imp       GEN           99.96%    59.69%       7.86%     93.31%          0
+  conj_assoc           CONJ          94.39%    43.89%       9.98%    100.00%          0
+  triple_conj_intro    CONJ          94.39%    29.51%       9.87%    100.00%          0
+
+  Legend:
+    unigram     = % walks where the rule entered _applicable ≥ 1×
+    precond     = % walks where shape-specific precondition was met ≥ 1×
+                  (rule applicable AND hypothesis-context requirement met)
+    sample|ctx  = of (walk,step) pairs with precond met, % where the
+                  inverse-freq sampler picked the target rule
+    apply|ctx   = of times the rule was sampled in-context, % where
+                  _try_apply succeeded
+    shape_hits  = walks whose completed rule shape matches the gold
+
+=== In-context _try_apply failures (Mode B signal) ===
+  mk_comb_impl: 2308/2860 sampled-in-context applications failed; failure-reason breakdown (11540 total reason events, may exceed n_fail if rule's retry loop logs multiple per call):
+    10355 ( 89.7%)  mk_comb: lhs not function
+     1185 ( 10.3%)  mk_comb: type mismatch
+  double_gen_imp: 3012/45007 sampled-in-context applications failed; failure-reason breakdown (15060 total reason events, may exceed n_fail if rule's retry loop logs multiple per call):
+    13133 ( 87.2%)  gen: var free in hyps (side cond)
+     1927 ( 12.8%)  gen: no free vars in concl
+  conj_assoc: 0 failures (apply succeeded every time the rule was sampled in-context)
+  triple_conj_intro: 0 failures (apply succeeded every time the rule was sampled in-context)
+
+=== Per-shape reads ===
+
+  mk_comb_impl  [Both]
+    unigram reach: 68.19%   precond reach: 3.87%   precond/unigram ratio: 0.057
+    sampled in-context: 2860 times, applied successfully: 19.30%
+
+  double_gen_imp  [Neither dominant — examine top failure reasons]
+    unigram reach: 99.96%   precond reach: 59.69%   precond/unigram ratio: 0.597
+    sampled in-context: 45007 times, applied successfully: 93.31%
+
+  conj_assoc  [Neither dominant — examine top failure reasons]
+    unigram reach: 94.39%   precond reach: 43.89%   precond/unigram ratio: 0.465
+    sampled in-context: 39793 times, applied successfully: 100.00%
+
+  triple_conj_intro  [Neither dominant — examine top failure reasons]
+    unigram reach: 94.39%   precond reach: 29.51%   precond/unigram ratio: 0.313
+    sampled in-context: 22891 times, applied successfully: 100.00%

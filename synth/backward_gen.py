@@ -42,6 +42,25 @@ from freq_counter import PositionRuleFreq
 
 
 # ---------------------------------------------------------------------------
+# Probe / instrumentation gate.
+#
+# When HOL_SYNTH_PROBE=1 in the environment, generate_one optionally fills
+# in a per-walk record (passed via the `probe_record` kwarg) capturing
+# applicable-set, sample, apply_ok, and side-condition failure reasons at
+# every step.  Provenance metadata is computed on each ProofStep so the
+# shape-specific precondition predicates can ask "is this step
+# ASSUME-derived (hypothesis-carrying)?" in O(1).
+#
+# With the env var unset, every probe hook is a `None` check that short-
+# circuits before any side effect — no extra RNG draws, no extra
+# allocations of significance, identical control flow.  This is verified
+# by a hash-equality test (probe-on output == probe-off output for a
+# fixed seed) in tests/synth/test_generator_probe_neutral.py.
+# ---------------------------------------------------------------------------
+_PROBE_ENABLED = os.environ.get("HOL_SYNTH_PROBE") == "1"
+
+
+# ---------------------------------------------------------------------------
 # Term sampling
 # ---------------------------------------------------------------------------
 BOOL_TY  = T.bool_ty()
@@ -98,6 +117,10 @@ class ProofStep:
     witness: tuple
     premises: List[int]
     thm: S.Thm   # derived theorem (kept for chaining)
+    # Probe-only.  Set by generate_one when HOL_SYNTH_PROBE=1: the
+    # transitive ancestor-rule set including this step's own rule
+    # (e.g. {"ASSUME","CONJ"}).  None when the probe is off.
+    provenance: Optional[frozenset] = None
 
 
 @dataclass
@@ -123,12 +146,90 @@ def _premise_with(steps: List[ProofStep],
     return rng.choice(cands)
 
 
+# ---------------------------------------------------------------------------
+# Probe helpers (no RNG; pure functions over walk state).
+# ---------------------------------------------------------------------------
+def _compute_provenance(rule: str,
+                         premises: List[int],
+                         steps: List[ProofStep]) -> frozenset:
+    """Transitive ancestor-rule set including this step's own rule.
+
+    For seed steps (no premises) this is just {rule}.  For derived
+    steps it unions the provenances of each premise — that's why we
+    store it on the ProofStep at append time rather than recomputing
+    from scratch.  O(arity) per step."""
+    prov = {rule}
+    if premises:
+        by_id = {s.id: s for s in steps}
+        for pid in premises:
+            p = by_id.get(pid)
+            if p is not None and p.provenance is not None:
+                prov |= p.provenance
+    return frozenset(prov)
+
+
+def _is_eq_concl(s: ProofStep) -> bool:
+    c = s.thm.concl
+    return (bool(c) and c[0] == "Comb"
+            and c[1][0] == "Comb"
+            and c[1][1][0] == "Const"
+            and c[1][1][1] == "=")
+
+
+def _hyp_carrying(s: ProofStep) -> bool:
+    """Step transitively depends on at least one ASSUME — i.e. has a
+    non-empty hypothesis set in the kernel sense.  Uses the probe-only
+    provenance metadata."""
+    return s.provenance is not None and "ASSUME" in s.provenance
+
+
+def _gen_side_cond_anywhere(steps: List[ProofStep]) -> bool:
+    """Is there any step on which GEN could fire — i.e. a free var in
+    its conclusion that is not also free in any of its hypotheses?
+    This is GEN's side condition (line 297 of _try_apply).  We check
+    it across the pool because the question 'is GEN positioned-ready'
+    is exactly: does such a step exist."""
+    for s in steps:
+        fvs = S.free_vars(s.thm.concl)
+        for (name, ty) in fvs:
+            if not any(S.has_free(name, ty, h) for h in s.thm.hyps):
+                return True
+    return False
+
+
+def _precond_flags(applicable: List[str],
+                    steps: List[ProofStep]) -> Dict[str, bool]:
+    """Per-target-shape readiness flags at the current walk state.
+
+    These match the brief's positioned-precondition definitions:
+    a rule being in `applicable` is the unigram check; these flags
+    additionally require the *kind* of premises the gold shape needs
+    (hypothesis-carrying, not REFL/ABS-derived)."""
+    hyp_eq    = sum(1 for s in steps if _is_eq_concl(s) and _hyp_carrying(s))
+    hyp_bool  = sum(1 for s in steps if S.is_bool(s.thm.concl) and _hyp_carrying(s))
+    has_hyp   = any(_hyp_carrying(s) for s in steps)
+    gen_ok    = "GEN" in applicable and _gen_side_cond_anywhere(steps)
+    return {
+        "mk_comb_impl_ready":      ("MK_COMB" in applicable) and hyp_eq >= 2,
+        "double_gen_imp_ready":    gen_ok and has_hyp,
+        "conj_assoc_ready":        ("CONJ" in applicable) and hyp_bool >= 2,
+        "triple_conj_intro_ready": ("CONJ" in applicable) and hyp_bool >= 3,
+    }
+
+
 def _try_apply(rule_name: str,
                steps: List[ProofStep],
-               rng: random.Random) -> Optional[ProofStep]:
+               rng: random.Random,
+               trace: Optional[list] = None) -> Optional[ProofStep]:
     """Try one application of `rule_name`.  Returns a new ProofStep on
     success, or None if the rule isn't currently applicable (no valid
     premises, type mismatch, etc.).
+
+    `trace`, when non-None (probe mode), is appended with
+    `(rule_name, str(err))` for every `S.RuleError` raised inside this
+    call — so the caller can distinguish 'rule failed because side
+    condition X' from 'rule failed because no candidate premise'.
+    Behaviour with `trace=None` is unchanged.
     """
     next_id = (steps[-1].id + 1) if steps else 1
     rule_fn, arity, wkind = S.RULES[rule_name]
@@ -139,7 +240,9 @@ def _try_apply(rule_name: str,
         witness = ("term", t)
         try:
             thm = S.refl(t)
-        except S.RuleError:
+        except S.RuleError as e:
+            if trace is not None:
+                trace.append((rule_name, str(e)))
             return None
         return ProofStep(next_id, "REFL", witness, [], thm)
 
@@ -148,7 +251,9 @@ def _try_apply(rule_name: str,
         witness = ("term", t)
         try:
             thm = S.assume(t)
-        except S.RuleError:
+        except S.RuleError as e:
+            if trace is not None:
+                trace.append((rule_name, str(e)))
             return None
         return ProofStep(next_id, "ASSUME", witness, [], thm)
 
@@ -166,7 +271,9 @@ def _try_apply(rule_name: str,
         redex = T.mk_comb(("Abs", name, ty, body), var)
         try:
             thm = S.beta(redex)
-        except S.RuleError:
+        except S.RuleError as e:
+            if trace is not None:
+                trace.append((rule_name, str(e)))
             return None
         return ProofStep(next_id, "BETA", ("term", redex), [], thm)
 
@@ -186,7 +293,9 @@ def _try_apply(rule_name: str,
                 thm = S.trans(a.thm, b.thm)
                 return ProofStep(next_id, "TRANS", ("none",),
                                  [a.id, b.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -205,7 +314,9 @@ def _try_apply(rule_name: str,
                 thm = S.mk_comb(a.thm, b.thm)
                 return ProofStep(next_id, "MK_COMB", ("none",),
                                  [a.id, b.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -234,7 +345,9 @@ def _try_apply(rule_name: str,
                 thm = S.abs_rule(v, a.thm)
                 return ProofStep(next_id, "ABS", ("var", name, ty),
                                  [a.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -255,7 +368,9 @@ def _try_apply(rule_name: str,
                 thm = S.disch(p, tgt.thm)
                 return ProofStep(next_id, "DISCH", ("term", p),
                                  [tgt.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -274,13 +389,17 @@ def _try_apply(rule_name: str,
             # Find a step proving `ante`.
             matches = [s for s in steps if S.alpha_eq(s.thm.concl, ante)]
             if not matches:
+                if trace is not None:
+                    trace.append((rule_name, "mp: no premise matches antecedent"))
                 continue
             b = rng.choice(matches)
             try:
                 thm = S.mp(a.thm, b.thm)
                 return ProofStep(next_id, "MP", ("none",),
                                  [a.id, b.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -291,17 +410,23 @@ def _try_apply(rule_name: str,
             a = rng.choice(steps)
             fvs_concl = S.free_vars(a.thm.concl)
             if not fvs_concl:
+                if trace is not None:
+                    trace.append((rule_name, "gen: no free vars in concl"))
                 continue
             name, ty = rng.choice(fvs_concl)
             # GEN requires the var not appear free in hyps.
             if any(S.has_free(name, ty, h) for h in a.thm.hyps):
+                if trace is not None:
+                    trace.append((rule_name, "gen: var free in hyps (side cond)"))
                 continue
             v = T.mk_var(name, ty)
             try:
                 thm = S.gen(v, a.thm)
                 return ProofStep(next_id, "GEN", ("var", name, ty),
                                  [a.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -327,7 +452,9 @@ def _try_apply(rule_name: str,
                 thm = S.spec(w, a.thm)
                 return ProofStep(next_id, "SPEC", ("term", w),
                                  [a.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -344,7 +471,9 @@ def _try_apply(rule_name: str,
                 thm = S.conj(a.thm, b.thm)
                 return ProofStep(next_id, "CONJ", ("none",),
                                  [a.id, b.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -360,7 +489,9 @@ def _try_apply(rule_name: str,
         try:
             thm = S.conjunct1(a.thm)
             return ProofStep(next_id, "CONJUNCT1", ("none",), [a.id], thm)
-        except S.RuleError:
+        except S.RuleError as e:
+            if trace is not None:
+                trace.append((rule_name, str(e)))
             return None
 
     if rule_name == "CONJUNCT2":
@@ -375,7 +506,9 @@ def _try_apply(rule_name: str,
         try:
             thm = S.conjunct2(a.thm)
             return ProofStep(next_id, "CONJUNCT2", ("none",), [a.id], thm)
-        except S.RuleError:
+        except S.RuleError as e:
+            if trace is not None:
+                trace.append((rule_name, str(e)))
             return None
 
     if rule_name == "EQ_MP":
@@ -392,13 +525,17 @@ def _try_apply(rule_name: str,
             lhs = a.thm.concl[1][2]
             matches = [s for s in steps if S.alpha_eq(s.thm.concl, lhs)]
             if not matches:
+                if trace is not None:
+                    trace.append((rule_name, "eq_mp: no premise matches LHS"))
                 continue
             b = rng.choice(matches)
             try:
                 thm = S.eq_mp(a.thm, b.thm)
                 return ProofStep(next_id, "EQ_MP", ("none",),
                                  [a.id, b.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -409,6 +546,8 @@ def _try_apply(rule_name: str,
             a = rng.choice(steps)
             fvs = S.free_vars(a.thm.concl)
             if not fvs:
+                if trace is not None:
+                    trace.append((rule_name, "inst: no free vars in concl"))
                 continue
             # Pick one free var to substitute.
             name, ty = rng.choice(fvs)
@@ -422,7 +561,9 @@ def _try_apply(rule_name: str,
                 thm = S.inst([(v, rhs)], a.thm)
                 return ProofStep(next_id, "INST", ("inst", [(v, rhs)]),
                                  [a.id], thm)
-            except S.RuleError:
+            except S.RuleError as e:
+                if trace is not None:
+                    trace.append((rule_name, str(e)))
                 continue
         return None
 
@@ -560,7 +701,8 @@ def generate_one(rng: random.Random,
                   target_depth: int,
                   max_failures: int = 80,
                   min_random_rules: int = 1,
-                  state: Optional[GeneratorState] = None) -> Optional[GenResult]:
+                  state: Optional[GeneratorState] = None,
+                  probe_record: Optional[dict] = None) -> Optional[GenResult]:
     """Generate one random proof, returning the gold (goal, cert) pair.
 
     target_depth is the TOTAL step count (seeds + random rules).  We
@@ -574,8 +716,21 @@ def generate_one(rng: random.Random,
     zero-premise rules that produce a non-trivial starting theorem;
     the bias kicks in from the third step onwards.
 
-    Returns None if the random walk got stuck."""
+    Returns None if the random walk got stuck.
+
+    Probe: when `probe_record` is a dict (non-None), it is populated
+    with `{"steps": [...], "completed_shape": [...]}` capturing the
+    full per-step trace.  Provenance metadata is filled in on each
+    ProofStep so the precondition predicates can ask "is this step
+    ASSUME-derived (hypothesis-carrying)?".  When `probe_record is
+    None` the function is byte-for-byte equivalent to the un-
+    instrumented version — no extra RNG draws, no provenance
+    computation."""
     steps: List[ProofStep] = []
+    _probing = probe_record is not None
+    if _probing and "steps" not in probe_record:
+        probe_record["steps"] = []
+
     # Seed pool.  Under the legacy (state=None) path keep the historical
     # ASSUME-3 / REFL-1 weighting.  Under the adaptive path, sample the
     # seed rule from {REFL, ASSUME, BETA} (the only zero-premise rules)
@@ -591,17 +746,33 @@ def generate_one(rng: random.Random,
                 break
             kind = _sample_rule(state, len(steps), seed_apps, rng)
             state.attempts[kind] = state.attempts.get(kind, 0) + 1
-            s = _try_apply(kind, steps, rng)
+            trace = [] if _probing else None
+            pre_pos = len(steps)
+            pre_precond = _precond_flags(seed_apps, steps) if _probing else None
+            s = _try_apply(kind, steps, rng, trace=trace)
             if s is not None:
+                if _probing:
+                    s.provenance = _compute_provenance(s.rule, s.premises, steps)
                 state.successes[kind] = state.successes.get(kind, 0) + 1
                 state.freq.bump(len(steps), kind)
                 steps.append(s)
+            if _probing:
+                probe_record["steps"].append({
+                    "pos": pre_pos,
+                    "applicable": list(seed_apps),
+                    "precond": pre_precond,
+                    "sampled": kind,
+                    "apply_ok": s is not None,
+                    "failures": trace or [],
+                })
         else:
             kind = rng.choices(["ASSUME", "REFL"], weights=[3.0, 1.0])[0]
             s = _try_apply(kind, steps, rng)
             if s is not None:
                 steps.append(s)
     if not steps:
+        if _probing:
+            probe_record["completed_shape"] = None
         return None
 
     failures = 0
@@ -620,12 +791,28 @@ def generate_one(rng: random.Random,
             state.attempts[rule] = state.attempts.get(rule, 0) + 1
         else:
             rule = rng.choices(rules, weights=weights)[0]
-        s = _try_apply(rule, steps, rng)
+            applicable = None  # legacy path doesn't compute it
+        trace = [] if (_probing and state is not None) else None
+        pre_pos = len(steps)
+        pre_precond = (_precond_flags(applicable, steps)
+                       if (_probing and state is not None) else None)
+        s = _try_apply(rule, steps, rng, trace=trace)
+        if _probing and state is not None:
+            probe_record["steps"].append({
+                "pos": pre_pos,
+                "applicable": list(applicable),
+                "precond": pre_precond,
+                "sampled": rule,
+                "apply_ok": s is not None,
+                "failures": trace or [],
+            })
         if s is None:
             failures += 1
             if failures > max_failures:
                 break
             continue
+        if _probing:
+            s.provenance = _compute_provenance(s.rule, s.premises, steps)
         steps.append(s)
         if state is not None:
             state.successes[rule] = state.successes.get(rule, 0) + 1
@@ -637,11 +824,15 @@ def generate_one(rng: random.Random,
         rounds_done += 1
 
     if len(steps) < 2 or rounds_done < min_random_rules:
+        if _probing:
+            probe_record["completed_shape"] = None
         return None
 
     # Goal = conclusion of the last (or "deepest" by id) step.
     target = steps[-1]
     shape = tuple(s.rule for s in steps)
+    if _probing:
+        probe_record["completed_shape"] = list(shape)
     return GenResult(goal=target.thm.concl, steps=steps, rule_shape=shape)
 
 
