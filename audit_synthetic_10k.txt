@@ -1,0 +1,51 @@
+counting lines in /mnt/nvme2/atp_runs/proof_machine/hol_expit_buffer.jsonl (source=synthetic)...
+  eligible entries: 1112949
+  500/10000  rate=5900/s
+  1000/10000  rate=5714/s
+  1500/10000  rate=5436/s
+  2000/10000  rate=5297/s
+  2500/10000  rate=5237/s
+  3000/10000  rate=5187/s
+  3500/10000  rate=5168/s
+  4000/10000  rate=5152/s
+  4500/10000  rate=5145/s
+  5000/10000  rate=5130/s
+  5500/10000  rate=5098/s
+  6000/10000  rate=5090/s
+  6500/10000  rate=5073/s
+  7000/10000  rate=5073/s
+  7500/10000  rate=5071/s
+  8000/10000  rate=5056/s
+  8500/10000  rate=5058/s
+  9000/10000  rate=5049/s
+  9500/10000  rate=5045/s
+  10000/10000  rate=5040/s
+
+=== Buffer contamination audit, n=10000 sampled ===
+  buffer file:  /mnt/nvme2/atp_runs/proof_machine/hol_expit_buffer.jsonl
+  source filter: synthetic
+  eligible:     1112949
+
+  source           total  reject    rate
+  synthetic        10000       0  0.000%
+  OVERALL          10000       0  0.000%
+
+=== Per-rule drift (cert-level, by set-membership in shape) ===
+  rule           certs  reject     rate vs_overall
+  EQ_MP             66       0   0.000%      0.00x
+  TRANS            248       0   0.000%      0.00x
+  MK_COMB          450       0   0.000%      0.00x
+  MP               962       0   0.000%      0.00x
+  SPEC            1295       0   0.000%      0.00x
+  CONJUNCT1       1309       0   0.000%      0.00x
+  CONJUNCT2       1356       0   0.000%      0.00x
+  ABS             2800       0   0.000%      0.00x
+  INST            2831       0   0.000%      0.00x
+  GEN             3010       0   0.000%      0.00x
+  CONJ            4228       0   0.000%      0.00x
+  BETA            4364       0   0.000%      0.00x
+  DISCH           5488       0   0.000%      0.00x
+  REFL            7170       0   0.000%      0.00x
+  ASSUME          8051       0   0.000%      0.00x
+
+elapsed: 2.0s
