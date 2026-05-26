@@ -43,6 +43,11 @@ export HOL_EXPIT_UPWEIGHT="${HOL_EXPIT_UPWEIGHT:-4.0}"
 export HOL_EXPIT_SYNTH_PER_ROUND="${HOL_EXPIT_SYNTH_PER_ROUND:-2000}"
 export HOL_EXPIT_SYNTH_MIN_DEPTH="${HOL_EXPIT_SYNTH_MIN_DEPTH:-2}"
 export HOL_EXPIT_SYNTH_MAX_DEPTH="${HOL_EXPIT_SYNTH_MAX_DEPTH:-10}"
+# Change 2: probability that a walk uses a structured premise-kit
+# prefix instead of the random ASSUME/REFL/BETA seed loop.  Set to
+# 0.0 to disable (exact backward-compat).  See synth/backward_gen.py
+# KITS for the kit registry.
+export HOL_SYNTH_KIT_PROB="${HOL_SYNTH_KIT_PROB:-0.5}"
 
 # Auto-restart on crash with exponential backoff capped at 60s.
 sleep_s=1

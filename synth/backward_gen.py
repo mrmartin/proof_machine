@@ -61,6 +61,20 @@ _PROBE_ENABLED = os.environ.get("HOL_SYNTH_PROBE") == "1"
 
 
 # ---------------------------------------------------------------------------
+# Premise-kit gate (Change 2).
+#
+# With probability `_KIT_PROB`, replace the random ASSUME/REFL/BETA seed
+# loop with a structured multi-ASSUME prefix designed to make the four
+# stuck-shape goals reachable.  The kit registry and the per-step term
+# constructor live near the top-level generator; see KITS below.
+#
+# Set HOL_SYNTH_KIT_PROB=0.0 to disable (exact backward compatibility
+# with pre-Change-2 walks).  Default 0.5 ships the kit ON in production.
+# ---------------------------------------------------------------------------
+_KIT_PROB = float(os.environ.get("HOL_SYNTH_KIT_PROB", "0.5"))
+
+
+# ---------------------------------------------------------------------------
 # Term sampling
 # ---------------------------------------------------------------------------
 BOOL_TY  = T.bool_ty()
@@ -632,13 +646,30 @@ def _try_apply(rule_name: str,
                 if trace is not None:
                     trace.append((rule_name, "inst: no free vars in concl"))
                 continue
+            # Restrict to atomic-typed free vars.  Function-typed
+            # substitutions via a fresh var-of-same-type don't produce
+            # useful new theorems, and the `["x"]` pool-fallback for
+            # non-atomic types can produce an empty candidate list
+            # when name=="x" (uncommon historically, but unlocked by
+            # the kit's introduction of function-typed vars).
+            atomic_fvs = [(n, t) for (n, t) in fvs
+                          if T.type_equal(t, NAT_TY)
+                          or T.type_equal(t, BOOL_TY)]
+            if not atomic_fvs:
+                if trace is not None:
+                    trace.append((rule_name,
+                                  "inst: no atomic-typed free vars to substitute"))
+                continue
             # Pick one free var to substitute.
-            name, ty = rng.choice(fvs)
+            name, ty = rng.choice(atomic_fvs)
             v = T.mk_var(name, ty)
-            # Replacement of same type — simplest: a different var.
-            pool = (VAR_POOL_NAT if T.type_equal(ty, NAT_TY)
-                    else (VAR_POOL_BOOL if T.type_equal(ty, BOOL_TY) else ["x"]))
-            rhs_name = rng.choice([p for p in pool if p != name])
+            pool = VAR_POOL_NAT if T.type_equal(ty, NAT_TY) else VAR_POOL_BOOL
+            candidates = [p for p in pool if p != name]
+            if not candidates:
+                if trace is not None:
+                    trace.append((rule_name, "inst: no other-named var in pool"))
+                continue
+            rhs_name = rng.choice(candidates)
             rhs = T.mk_var(rhs_name, ty)
             try:
                 thm = S.inst([(v, rhs)], a.thm)
@@ -780,6 +811,122 @@ def _sample_rule(state: GeneratorState,
     return rng.choices(applicable, weights=probs)[0]
 
 
+# ---------------------------------------------------------------------------
+# Premise kits (Change 2 — forward-walk premise kit).
+#
+# Each kit is a list of (rule, shape, args) tuples specifying the head
+# of the walk.  Currently all kit steps are ASSUMEs — the four kits
+# directly correspond to the four stuck-shape preconditions identified
+# by the joint-reachability probe:
+#
+#   triple_bool      — ≥3 distinct bool ASSUMEs (triple_conj_intro,
+#                      double_gen_imp)
+#   nested_conj      — ASSUME ((p∧q)∧r) (conj_assoc)
+#   fn_eq_pair       — ASSUME (f=g) function-typed + ASSUME (a=b)
+#                      domain-typed (mk_comb_impl)
+#   double_bool      — ≥2 distinct bool ASSUMEs (lighter general
+#                      two-hyp seed)
+#
+# The probe with corrected precond predicates (commit f4bdc1a) showed
+# precond reach of 0.45% / 9.84% / 6.00% for the three multi-hyp
+# shapes; with KIT_PROB=0.5 and uniform kit selection each kit fires
+# ~12.5% of walks.  Target lifts measured by re-running the probe.
+# ---------------------------------------------------------------------------
+KITS: Dict[str, List[Tuple[str, str, object]]] = {
+    "triple_bool": [
+        ("ASSUME", "bool_var", "p"),
+        ("ASSUME", "bool_var", "q"),
+        ("ASSUME", "bool_var", "r"),
+    ],
+    "nested_conj": [
+        ("ASSUME", "nested_conj_bool", ("p", "q", "r")),
+    ],
+    "fn_eq_pair": [
+        ("ASSUME", "fn_eq", ("f", "g", "nat", "bool")),
+        ("ASSUME", "atom_eq", ("a", "b", "nat")),
+    ],
+    "double_bool": [
+        ("ASSUME", "bool_var", "p"),
+        ("ASSUME", "bool_var", "q"),
+    ],
+}
+
+
+def _kit_step_term(shape: str, args) -> Optional[tuple]:
+    """Construct the term for one kit step.  Returns None if the
+    shape descriptor is unknown — kits should be well-formed, so this
+    is a defensive guard, not an expected path."""
+    if shape == "bool_var":
+        name = args
+        return T.mk_var(name, BOOL_TY)
+    if shape == "atom_eq":
+        a, b, ty_name = args
+        ty = NAT_TY if ty_name == "nat" else BOOL_TY
+        return T.mk_eq(T.mk_var(a, ty), T.mk_var(b, ty))
+    if shape == "fn_eq":
+        f, g, dom_name, cod_name = args
+        dom = NAT_TY if dom_name == "nat" else BOOL_TY
+        cod = NAT_TY if cod_name == "nat" else BOOL_TY
+        fn_ty = ("Tyapp", "fun", [dom, cod])
+        return T.mk_eq(T.mk_var(f, fn_ty), T.mk_var(g, fn_ty))
+    if shape == "nested_conj_bool":
+        p, q, r = args
+        inner = T.mk_conj(T.mk_var(p, BOOL_TY), T.mk_var(q, BOOL_TY))
+        return T.mk_conj(inner, T.mk_var(r, BOOL_TY))
+    return None
+
+
+def _apply_seed_kit(kit: List[Tuple[str, str, object]],
+                     steps: List[ProofStep],
+                     state: GeneratorState,
+                     rng: random.Random,
+                     probe_record: Optional[dict]) -> bool:
+    """Apply a kit's seed sequence.  Each step is a forced ASSUME of
+    a specific term.  Mirrors the adaptive seed-loop's state mutations
+    (state.attempts, state.successes, state.freq.bump) and probe
+    bookkeeping so the rest of the walk sees identical state-shape
+    invariants.  Returns True on full success; False if any step
+    failed term-construction or kernel-assume (in which case the
+    caller falls back to the random seed loop).
+
+    `rng` is accepted for signature symmetry with `_try_apply` but
+    not consumed — kit step selection is deterministic given the
+    chosen kit, so kit application makes no rng calls."""
+    _probing = probe_record is not None
+    for kit_step in kit:
+        rule, shape, args = kit_step
+        if rule != "ASSUME":
+            return False
+        t = _kit_step_term(shape, args)
+        if t is None:
+            return False
+        try:
+            thm = S.assume(t)
+        except S.RuleError:
+            return False
+        next_id = (steps[-1].id + 1) if steps else 1
+        s = ProofStep(next_id, "ASSUME", ("term", t), [], thm)
+        if _probing:
+            s.provenance = _compute_provenance(s.rule, s.premises, steps)
+        state.attempts["ASSUME"] = state.attempts.get("ASSUME", 0) + 1
+        state.successes["ASSUME"] = state.successes.get("ASSUME", 0) + 1
+        state.freq.bump(len(steps), "ASSUME")
+        if _probing:
+            applicable_at_pos = [r for r in ("REFL", "ASSUME", "BETA")
+                                 if _applicable(r, steps)]
+            probe_record["steps"].append({
+                "pos": len(steps),
+                "applicable": applicable_at_pos,
+                "precond": _precond_flags(applicable_at_pos, steps),
+                "sampled": "ASSUME",
+                "apply_ok": True,
+                "failures": [],
+                "kit": True,
+            })
+        steps.append(s)
+    return True
+
+
 def generate_one(rng: random.Random,
                   target_depth: int,
                   max_failures: int = 80,
@@ -818,10 +965,25 @@ def generate_one(rng: random.Random,
     # ASSUME-3 / REFL-1 weighting.  Under the adaptive path, sample the
     # seed rule from {REFL, ASSUME, BETA} (the only zero-premise rules)
     # via _sample_rule, which routes position-0 frequency feedback
-    # through the same inverse-frequency mechanism — without this, the
-    # seed-pool hardcoding pins pathology #1 in place.
-    seed_count = rng.choice([1, 2])
+    # through the same inverse-frequency mechanism.
+    #
+    # Change 2: with probability `_KIT_PROB` (default 0.5, env var
+    # HOL_SYNTH_KIT_PROB) replace the random seed loop with a
+    # structured multi-ASSUME prefix from KITS.  Kits seed the four
+    # stuck-shape preconditions directly — without them, the random
+    # seed loop's ASSUME-1-or-2 produces these prefixes too rarely
+    # for the gold shapes to compose.  Setting KIT_PROB=0.0 reverts
+    # to exact pre-Change-2 behaviour.
     seed_zero_premise = ("REFL", "ASSUME", "BETA")
+    kit_fired = False
+    if state is not None and _KIT_PROB > 0.0 and rng.random() < _KIT_PROB:
+        kit_name = rng.choice(list(KITS.keys()))
+        if _apply_seed_kit(KITS[kit_name], steps, state, rng, probe_record):
+            kit_fired = True
+    if kit_fired:
+        seed_count = 0  # kit replaced the seed loop entirely
+    else:
+        seed_count = rng.choice([1, 2])
     for _ in range(seed_count):
         if state is not None:
             seed_apps = [r for r in seed_zero_premise if _applicable(r, steps)]

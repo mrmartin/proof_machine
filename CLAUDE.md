@@ -73,6 +73,7 @@ All knobs are env vars; defaults are in `scripts/train_continuous.sh`.
 | `HOL_EXPIT_SYNTH_MIN_DEPTH`      | min synth proof depth | 2 |
 | `HOL_EXPIT_SYNTH_MAX_DEPTH`      | max synth proof depth | 10 |
 | `HOL_EXPIT_SYNTH_TEMP`           | adaptive inverse-freq sampler temperature (lower = stronger rare-rule boost; T=1.0 over-corrects to BETA at position 0; T=2.0 is the empirical sweet spot) | 2.0 |
+| `HOL_SYNTH_KIT_PROB`             | probability a synth walk uses a structured premise-kit prefix (Change 2) instead of the random seed loop; 0.0 = exact pre-kit behaviour | 0.5 |
 
 When you change one of these, the change applies to **future rounds
 only** — the corpus + checkpoint from prior rounds are kept.
@@ -96,6 +97,31 @@ REFL) but introduces a known asymmetry: BETA is rare in the corpus
 is a tuned trade-off.  If you see BETA dominating position 0 of new
 samples, raise T to 3–4.  If TRANS / MK_COMB are still under 1%, lower
 T to 1.5.
+
+### Premise kits (Change 2)
+
+Independent of the inverse-frequency sampler, each synth walk has a
+`HOL_SYNTH_KIT_PROB` chance of starting with a *structured*
+multi-ASSUME prefix instead of the random seed loop.  Four kits are
+registered in `synth/backward_gen.py:KITS`:
+
+| Kit | Steps | Targets |
+|-----|-------|---------|
+| `triple_bool`  | ASSUME p, ASSUME q, ASSUME r (atomic bool)             | triple_conj_intro, double_gen_imp |
+| `nested_conj`  | ASSUME ((p ∧ q) ∧ r)                                    | conj_assoc |
+| `fn_eq_pair`   | ASSUME (f = g) [nat→bool] + ASSUME (a = b) [nat]        | mk_comb_impl |
+| `double_bool`  | ASSUME p, ASSUME q (atomic bool)                        | general two-hyp seed |
+
+When the kit fires (uniform random choice across the four), it
+replaces the seed loop entirely.  The walk's main loop then composes
+rules on top of the kit's hypothesis configuration.  The kit produces
+exactly the kind of co-present hypotheses the four stuck-shape gold
+proofs need; without them the random walk hits these prefixes only at
+~0.5%–10% of walks (see `probe_report_20260525_091307.txt` for the
+pre-kit baseline; `probe_report_20260526_063829.txt` for the post-kit
+measurement).
+
+Set `HOL_SYNTH_KIT_PROB=0.0` for exact pre-Change-2 behaviour.
 
 ## Inspecting progress
 
